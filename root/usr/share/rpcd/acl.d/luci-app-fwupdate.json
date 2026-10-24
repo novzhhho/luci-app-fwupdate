@@ -1,0 +1,15 @@
+{
+	"luci-app-fwupdate": {
+		"description": "Grant access to the fwupdate ubus object",
+		"read": {
+			"ubus": {
+				"luci.fwupdate": [ "status", "check", "log" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.fwupdate": [ "start", "setconfig" ]
+			}
+		}
+	}
+}

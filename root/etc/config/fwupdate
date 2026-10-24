@@ -1,0 +1,4 @@
+
+config fwupdate 'main'
+	option repo ''
+	option mirror ''

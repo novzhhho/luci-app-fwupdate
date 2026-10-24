@@ -1,0 +1,174 @@
+#!/bin/sh
+# /usr/bin/fwupdate —— 从本仓库的 GitHub Release 拉取固件并就地升级
+#
+#   fwupdate          检查并升级（刷写前二次确认）
+#   fwupdate -c       只检查、只下载，不刷
+#   fwupdate -y       不确认，直接刷
+#   fwupdate -f       版本号相同也强制重刷
+#   fwupdate -l       只列出最近几个可用版本
+#
+# 仓库地址在构建时写入 /etc/fwupdate-repo，也可用 uci 覆盖：
+#   uci set fwupdate.main.repo='user/repo'
+#   uci set fwupdate.main.mirror='https://ghfast.top/'   # 可选下载加速前缀
+#   uci commit fwupdate
+#
+# 刷机仅替换 rootfs/kernel，默认保留配置（走 sysupgrade 标准流程）。
+
+REPO_FILE=/etc/fw-version      # 里面存的是构建时的版本 tag（只读展示用）
+REPO_CFG=/etc/fwupdate-repo    # 里面存的是 owner/repo
+WORK=/tmp/fwupdate.d
+
+CHECK_ONLY=0
+ASSUME_YES=0
+FORCE=0
+LIST_ONLY=0
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-c) CHECK_ONLY=1 ;;
+		-y) ASSUME_YES=1 ;;
+		-f) FORCE=1 ;;
+		-l) LIST_ONLY=1 ;;
+		-h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+		*) echo "未知参数: $1（用 -h 看用法）" >&2; exit 1 ;;
+	esac
+	shift
+done
+
+die()  { echo "[fwupdate] 错误: $*" >&2; exit 1; }
+info() { echo "[fwupdate] $*"; }
+
+# 取文件前 2 字节的十六进制。
+# 注意：ImmortalWrt(apk 版) 默认**不带 od**（实测 od: not found），
+# 只有 /usr/bin/hexdump；所以以 hexdump 为主、od 为备，两者都没有就返回空。
+hex2() {
+	if command -v hexdump >/dev/null 2>&1; then
+		hexdump -v -n 2 -e '2/1 "%02x"' "$1" 2>/dev/null
+	elif command -v od >/dev/null 2>&1; then
+		od -An -tx1 -N 2 "$1" 2>/dev/null | tr -d ' \n'
+	fi
+}
+
+REPO=$(uci -q get fwupdate.main.repo)
+[ -n "$REPO" ] || REPO=$(cat "$REPO_CFG" 2>/dev/null | tr -d ' \r\n')
+[ -n "$REPO" ] || die "未配置仓库（$REPO_CFG 为空，且 uci 未设置 fwupdate.main.repo）"
+
+MIRROR=$(uci -q get fwupdate.main.mirror)
+
+CUR=$(cat $REPO_FILE 2>/dev/null | tr -d ' \r\n')
+[ -n "$CUR" ] || CUR="unknown"
+
+API="https://api.github.com/repos/$REPO"
+
+info "仓库:     $REPO"
+info "当前版本: $CUR"
+
+if [ "$LIST_ONLY" = 1 ]; then
+	curl -fsSL --retry 3 --connect-timeout 15 -H 'User-Agent: fwupdate' \
+		"$API/releases?per_page=10" \
+		| jsonfilter -e '@[*].tag_name' 2>/dev/null | sed 's/^/[tag] /'
+	exit 0
+fi
+
+JSON=$(curl -fsSL --retry 3 --connect-timeout 15 \
+	-H 'Accept: application/vnd.github+json' \
+	-H 'User-Agent: fwupdate' "$API/releases/latest") \
+	|| die "访问 GitHub API 失败（网络不通或被限流）"
+
+TAG=$(echo "$JSON" | jsonfilter -e '@.tag_name' 2>/dev/null)
+[ -n "$TAG" ] || die "解析 Release 失败"
+
+info "最新版本: $TAG"
+
+if [ "$TAG" = "$CUR" ] && [ "$FORCE" = 0 ]; then
+	info "已是最新，无需升级（-f 可强制重刷）"
+	exit 0
+fi
+
+# 优先 .img.gz，退而求其次 .img
+URL=$(echo "$JSON" | jsonfilter -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img\.gz$' | head -1)
+[ -n "$URL" ] || URL=$(echo "$JSON" | jsonfilter -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img$' | head -1)
+[ -n "$URL" ] || die "该 Release 里没有 .img / .img.gz 资产"
+
+NAME=$(basename "$URL")
+mkdir -p "$WORK"
+IMG="$WORK/$NAME"
+rm -f "$IMG"
+
+DL="$URL"
+[ -n "$MIRROR" ] && DL="${MIRROR}${URL}"
+
+# 按资产名取大小（@.assets[0] 是随便挑的第一个，不一定是固件）
+SIZE=$(echo "$JSON" | jsonfilter -e "@.assets[@.name=\"$NAME\"].size" 2>/dev/null)
+case "$SIZE" in
+	''|*[!0-9]*) ;;
+	*) info "固件大小: $((SIZE / 1024 / 1024)) MB" ;;
+esac
+
+info "下载:     $DL"
+# 只有交互终端才显示进度条；LuCI/非 tty 下静默，避免刷屏
+if [ -t 1 ]; then
+	curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "$IMG" "$DL" || die "下载失败"
+else
+	curl -fsSL --retry 3 --connect-timeout 15 -o "$IMG" "$DL" || die "下载失败"
+fi
+
+# 校验 sha256：先试 <url>.sha256，再试同名 .sha256
+SHA=""
+for cand in "${URL}.sha256" "${URL%.gz}.sha256"; do
+	if curl -fsSL --retry 2 --connect-timeout 15 -o "$WORK/sum.txt" "${MIRROR}${cand}" 2>/dev/null; then
+		SHA=$(awk '{print $1}' "$WORK/sum.txt" | head -1)
+		[ -n "$SHA" ] && break
+	fi
+done
+
+if [ -n "$SHA" ]; then
+	ACT=$(sha256sum "$IMG" | awk '{print $1}')
+	if [ "$SHA" != "$ACT" ]; then
+		rm -f "$IMG"
+		die "sha256 校验失败（期望 $SHA，实际 $ACT）"
+	fi
+	info "sha256:   校验通过"
+else
+	info "sha256:   Release 未提供校验文件，跳过"
+fi
+
+# 轻量合法性检查：只验 gzip 魔数。
+# 不能靠 gzip -t 的退出码：ImmortalWrt 的 sysupgrade.img.gz 在 gzip 流末尾
+# 附加了一段 sysupgrade 需要的元数据，GNU gzip 会返回 2（trailing garbage），
+# busybox 下更是不可预期 —— 拿它判完整性会误杀正常镜像。完整性由 sha256 保证。
+case "$IMG" in
+	*.gz)
+		magic=$(hex2 "$IMG")
+		if [ -z "$magic" ]; then
+			info "gzip:     跳过格式检查（无 hexdump/od）"
+		elif [ "$magic" = "1f8b" ]; then
+			info "gzip:     魔数校验通过"
+		else
+			die "不是 gzip 文件（魔数: $magic）"
+		fi
+		;;
+esac
+
+ls -lh "$IMG"
+
+if [ "$CHECK_ONLY" = 1 ]; then
+	info "已下载到 $IMG（-c 模式，不刷写）"
+	exit 0
+fi
+
+if [ "$ASSUME_YES" = 0 ]; then
+	echo
+	echo "即将刷写 $TAG"
+	echo "  · 期间会断网并自动重启"
+	echo "  · 默认保留现有配置（/etc/config、已装插件设置）"
+	printf '继续？[y/N] '
+	read -r ans
+	case "$ans" in
+		y|Y|yes|YES) ;;
+		*) info "已取消"; rm -f "$IMG"; exit 0 ;;
+	esac
+fi
+
+info "开始刷写 ..."
+sysupgrade -v "$IMG"

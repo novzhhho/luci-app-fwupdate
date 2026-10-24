@@ -1,0 +1,20 @@
+#!/bin/sh
+# 首次启动：把构建时写入的 /etc/fwupdate-repo 迁移到 uci 配置里，
+# 这样界面上的「仓库」输入框有值可改。
+
+[ -f /etc/fwupdate-repo ] || exit 0
+
+cur=$(uci -q get fwupdate.main.repo)
+[ -n "$cur" ] && exit 0
+
+repo=$(tr -d ' \r\n' < /etc/fwupdate-repo)
+[ -n "$repo" ] || exit 0
+
+uci -q get fwupdate.main >/dev/null 2>&1 || uci -q set fwupdate.main=fwupdate
+uci -q set "fwupdate.main.repo=$repo"
+uci -q commit fwupdate
+
+# 新装的 rpcd 插件进程未必已加载，重启一次让 ubus 对象出现
+/etc/init.d/rpcd reload >/dev/null 2>&1
+
+exit 0

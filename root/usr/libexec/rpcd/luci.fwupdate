@@ -1,0 +1,268 @@
+#!/bin/sh
+# luci-app-fwupdate —— rpcd 后端
+#
+# rpcd 协议：`<script> list` 输出方法表；`<script> call <method>` 从 stdin
+# 读 JSON 参数，把结果 JSON 打到 stdout。所有方法都返回 { "ok": true/false }。
+#
+# 设计要点：
+#   * check 只调 GitHub API（几秒内返回），不在 rpcd 里做 40MB 下载；
+#   * start 把 /usr/bin/fwupdate 丢到后台跑，立刻返回，前端轮询 log 看重进度；
+#   * 真正的下载/校验/刷写逻辑全在 /usr/bin/fwupdate 里，这里只是壳。
+
+. /usr/share/libubox/jshn.sh
+
+BIN=/usr/bin/fwupdate
+CACHE=/tmp/fwupdate-check.json
+LOG=/tmp/fwupdate.log
+DLDIR=/tmp/fwupdate.d
+REPO_FALLBACK=/etc/fwupdate-repo
+VER_FILE=/etc/fw-version
+UA='luci-app-fwupdate'
+
+cfg() { uci -q get "fwupdate.main.$1" 2>/dev/null; }
+
+get_repo() {
+	local r
+	r=$(cfg repo)
+	[ -n "$r" ] || r=$(tr -d ' \r\n' < "$REPO_FALLBACK" 2>/dev/null)
+	echo "$r"
+}
+
+get_cur() { tr -d ' \r\n' < "$VER_FILE" 2>/dev/null; }
+
+# 后台升级是否在跑。只认完整的二进制路径，避免匹配到本脚本自己。
+is_running() {
+	if command -v pgrep >/dev/null 2>&1; then
+		pgrep -f "$BIN" >/dev/null 2>&1
+	else
+		ps w 2>/dev/null | grep -v grep | grep -q "$BIN"
+	fi
+}
+
+reply_err() {
+	json_init
+	json_add_boolean ok 0
+	json_add_string error "$1"
+	json_dump
+}
+
+# ---------------------------------------------------------------- status
+do_status() {
+	local cur repo latest size ts has
+
+	cur=$(get_cur)
+	repo=$(get_repo)
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string current "$cur"
+	json_add_string repo "$repo"
+	json_add_string mirror "$(cfg mirror)"
+	json_add_boolean has_bin "$([ -x "$BIN" ] && echo 1 || echo 0)"
+
+	if [ -f "$CACHE" ]; then
+		latest=$(jsonfilter -i "$CACHE" -e '@.tag' 2>/dev/null)
+		size=$(jsonfilter -i "$CACHE" -e '@.size' 2>/dev/null)
+		ts=$(jsonfilter -i "$CACHE" -e '@.checked_at' 2>/dev/null)
+		pub=$(jsonfilter -i "$CACHE" -e '@.published_at' 2>/dev/null)
+		body=$(jsonfilter -i "$CACHE" -e '@.body' 2>/dev/null)
+		has=0
+		[ -n "$latest" ] && [ "$latest" != "$cur" ] && has=1
+		json_add_string latest "$latest"
+		json_add_int size "${size:-0}"
+		json_add_int checked_at "${ts:-0}"
+		json_add_string published_at "$pub"
+		json_add_string body "$body"
+		json_add_boolean has_update "$has"
+	else
+		json_add_string latest ""
+		json_add_int size 0
+		json_add_int checked_at 0
+		json_add_string published_at ""
+		json_add_string body ""
+		json_add_boolean has_update 0
+	fi
+
+	json_add_boolean running "$(is_running && echo 1 || echo 0)"
+	json_dump
+}
+
+# ---------------------------------------------------------------- check
+do_check() {
+	local repo api tmp code tag url name size pub body cur has
+
+	repo=$(get_repo)
+	[ -n "$repo" ] || { reply_err "还没有配置 GitHub 仓库（owner/repo）"; return; }
+	case "$repo" in
+		*/*) ;;
+		*) reply_err "仓库格式应为 owner/repo"; return ;;
+	esac
+
+	api="https://api.github.com/repos/$repo/releases/latest"
+	tmp=/tmp/fwupdate-release.json
+	rm -f "$tmp"
+
+	code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+		--retry 2 --connect-timeout 10 -m 30 \
+		-H 'Accept: application/vnd.github+json' \
+		-H "User-Agent: $UA" "$api" 2>/dev/null)
+
+	case "$code" in
+		200) ;;
+		404) reply_err "仓库不存在，或该仓库还没有发布 Release（HTTP 404）"; return ;;
+		403) reply_err "GitHub API 被限流（HTTP 403），过几分钟再试"; return ;;
+		''|000) reply_err "连不上 GitHub API（检查路由器网络 / DNS）"; return ;;
+		*) reply_err "GitHub API 返回 HTTP $code"; return ;;
+	esac
+
+	tag=$(jsonfilter -i "$tmp" -e '@.tag_name' 2>/dev/null)
+	[ -n "$tag" ] || { reply_err "解析 Release 失败（没有 tag_name）"; return; }
+
+	url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img\.gz$' | head -n1)
+	[ -n "$url" ] || url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img$' | head -n1)
+	[ -n "$url" ] || { reply_err "该 Release 里没有 .img.gz / .img 资产"; return; }
+
+	name=${url##*/}
+	size=$(jsonfilter -i "$tmp" -e "@.assets[@.name=\"$name\"].size" 2>/dev/null)
+	pub=$(jsonfilter -i "$tmp" -e '@.published_at' 2>/dev/null)
+	body=$(jsonfilter -i "$tmp" -e '@.body' 2>/dev/null)
+	[ -n "$body" ] && [ ${#body} -gt 3000 ] && body=$(printf '%s' "$body" | head -c 3000)
+
+	cur=$(get_cur)
+	has=0
+	[ -n "$cur" ] && [ "$tag" != "$cur" ] && has=1
+
+	# 缓存给 status / log 用
+	json_init
+	json_add_string tag "$tag"
+	json_add_string url "$url"
+	json_add_int size "${size:-0}"
+	json_add_string published_at "$pub"
+	json_add_int checked_at "$(date +%s)"
+	json_add_string body "$body"
+	json_dump > "$CACHE"
+	json_cleanup
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string current "$cur"
+	json_add_string tag "$tag"
+	json_add_string url "$url"
+	json_add_int size "${size:-0}"
+	json_add_string published_at "$pub"
+	json_add_int checked_at "$(date +%s)"
+	json_add_string body "$body"
+	json_add_boolean has_update "$has"
+	json_dump
+}
+
+# ---------------------------------------------------------------- start
+do_start() {
+	local repo
+
+	repo=$(get_repo)
+	[ -n "$repo" ] || { reply_err "还没有配置 GitHub 仓库"; return; }
+	[ -x "$BIN" ] || { reply_err "缺少升级引擎 $BIN"; return; }
+	is_running && { reply_err "已有升级任务在运行"; return; }
+
+	: > "$LOG"
+
+	# 后台跑，rpcd 退出不影响它。
+	# 注意：`start-stop-daemon -b` 会把子进程的 stdout/stderr 接到 /dev/null（实测日志
+	# 恒为 0 字节），重定向必须在子进程内部做才留得住。setsid + sh -c 已验证可用。
+	if command -v setsid >/dev/null 2>&1; then
+		setsid /bin/sh -c "exec $BIN -y >>$LOG 2>&1" </dev/null &
+	else
+		start-stop-daemon -S -b -q -x "$BIN" -- -y
+	fi
+
+	json_init
+	json_add_boolean ok 1
+	json_dump
+}
+
+# ---------------------------------------------------------------- log
+do_log() {
+	local run=0 sz=0 total=0
+
+	is_running && run=1
+	[ -f "$CACHE" ] && total=$(jsonfilter -i "$CACHE" -e '@.size' 2>/dev/null)
+	sz=$(ls -l "$DLDIR"/*.img.gz "$DLDIR"/*.img 2>/dev/null | head -n1 | awk '{print $5}')
+
+	json_init
+	json_add_boolean ok 1
+	json_add_boolean running "$run"
+	json_add_string log "$(tail -c 6000 "$LOG" 2>/dev/null)"
+	json_add_int downloaded "${sz:-0}"
+	json_add_int total "${total:-0}"
+	json_dump
+}
+
+# ---------------------------------------------------------------- setconfig
+do_setconfig() {
+	local payload repo mirror
+
+	payload=$(cat)
+	json_load "$payload" 2>/dev/null
+	json_get_var repo repo
+	json_get_var mirror mirror
+
+	case "$repo" in
+		'') ;;
+		*[!A-Za-z0-9._/-]*) reply_err "仓库名含非法字符"; return ;;
+		*/*) ;;
+		*) reply_err "仓库格式应为 owner/repo"; return ;;
+	esac
+
+	case "$mirror" in
+		'') ;;
+		http://*|https://*) ;;
+		*) reply_err "镜像地址要以 http:// 或 https:// 开头"; return ;;
+	esac
+
+	uci -q get fwupdate.main >/dev/null 2>&1 || uci -q set fwupdate.main=fwupdate
+	uci -q set "fwupdate.main.repo=$repo"
+	uci -q set "fwupdate.main.mirror=$mirror"
+	uci -q commit fwupdate || { reply_err "写入 uci 失败"; return; }
+
+	# 仓库变了，旧检查结果作废
+	rm -f "$CACHE"
+
+	json_init
+	json_add_boolean ok 1
+	json_dump
+}
+
+# ---------------------------------------------------------------- dispatch
+case "$1" in
+	list)
+		json_init
+		json_add_object status
+		json_close_object
+		json_add_object check
+		json_close_object
+		json_add_object log
+		json_close_object
+		json_add_object start
+		json_close_object
+		json_add_object setconfig
+		json_add_string repo str
+		json_add_string mirror str
+		json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			status)    do_status ;;
+			check)     do_check ;;
+			log)       do_log ;;
+			start)     do_start ;;
+			setconfig) do_setconfig ;;
+			*)         reply_err "未知方法: $2" ;;
+		esac
+		;;
+	*)
+		echo "usage: $0 list | call <method>" >&2
+		exit 1
+		;;
+esac

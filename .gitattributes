@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+# 路由器上的脚本必须是 LF，否则 shebang 失效
+*.sh    text eol=lf
+fwupdate text eol=lf
+luci.fwupdate text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+Makefile text eol=lf
