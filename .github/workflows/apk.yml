@@ -1,0 +1,142 @@
+name: Plugin APK
+
+# 插件是纯 shell + JS，没有需要编译的东西。所以不走 OpenWrt SDK（那会连带
+# 编译 luci-base 的依赖，SDK 里没有那些头文件），而是直接用 apk-tools 3 的
+# mkpkg 把文件树打成 apk —— 和 OpenWrt 官方打包用的是同一个参数序列。
+#
+# 产物发布到 tag=<commit 短 sha> 的 Release，路由器上的插件据此自更新。
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PKG_NAME: luci-app-fwupdate
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 需要完整历史才能用 commit 数当 PKG_RELEASE
+
+      - name: Stamp version & build sha
+        id: v
+        run: |
+          set -euo pipefail
+          SHA7=$(git rev-parse --short=7 HEAD)
+          COUNT=$(git rev-list --count HEAD)
+          echo "sha=$SHA7"            >> "$GITHUB_OUTPUT"
+          echo "ver=1.0.0-r${COUNT}"  >> "$GITHUB_OUTPUT"
+          echo "commit 短 sha = $SHA7, commit 数 = $COUNT"
+
+      - name: Assemble package tree
+        run: |
+          set -euo pipefail
+          NAME="$PKG_NAME"
+          ROOT="build/pkgroot"
+
+          rm -rf build dist
+          mkdir -p "$ROOT" build/apkscripts dist
+
+          # ---- 文件树：和 luci.mk 安装规则一致（htdocs → /www）----
+          install -D -m755 root/usr/bin/fwupdate                                  "$ROOT/usr/bin/fwupdate"
+          install -D -m755 root/usr/libexec/rpcd/luci.fwupdate                    "$ROOT/usr/libexec/rpcd/luci.fwupdate"
+          install -D -m644 root/usr/share/luci/menu.d/luci-app-fwupdate.json      "$ROOT/usr/share/luci/menu.d/luci-app-fwupdate.json"
+          install -D -m644 root/usr/share/rpcd/acl.d/luci-app-fwupdate.json       "$ROOT/usr/share/rpcd/acl.d/luci-app-fwupdate.json"
+          install -D -m600 root/etc/config/fwupdate                               "$ROOT/etc/config/fwupdate"
+          install -D -m755 root/etc/uci-defaults/95_luci-app-fwupdate             "$ROOT/etc/uci-defaults/95_luci-app-fwupdate"
+          install -D -m644 htdocs/luci-static/resources/view/fwupdate/overview.js "$ROOT/www/luci-static/resources/view/fwupdate/overview.js"
+
+          # ---- 构建指纹：界面显示 + 自更新比对 ----
+          mkdir -p "$ROOT/usr/share/luci-app-fwupdate"
+          echo "${{ steps.v.outputs.sha }}" > "$ROOT/usr/share/luci-app-fwupdate/build"
+          chmod 644 "$ROOT/usr/share/luci-app-fwupdate/build"
+
+          # ---- 文件清单（apk 用它做 audit / 归属校验，OpenWrt 也是这么生成的）----
+          mkdir -p "$ROOT/lib/apk/packages"
+          ( cd "$ROOT" && find . \( -type f -o -type l \) | sed 's|^\.||' | sort ) > "/tmp/$NAME.list"
+          mv "/tmp/$NAME.list" "$ROOT/lib/apk/packages/$NAME.list"
+
+          # ---- 安装脚本 ----
+          cat > build/apkscripts/post-install <<'EOS'
+          #!/bin/sh
+          /etc/init.d/rpcd reload >/dev/null 2>&1
+          exit 0
+          EOS
+          cp build/apkscripts/post-install build/apkscripts/post-upgrade
+          chmod 755 build/apkscripts/post-install build/apkscripts/post-upgrade
+
+          echo '--- 打包内容 ---'
+          find "$ROOT" -type f | sort
+
+      - name: Build apk with mkpkg
+        env:
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w -e SOURCE_DATE_EPOCH=0 alpine:edge sh -c '
+            set -e
+            apk --version
+            apk mkpkg \
+              --info "name:luci-app-fwupdate" \
+              --info "version:'"$VER"'" \
+              --info "arch:noarch" \
+              --info "description:LuCI app to check and install firmware updates from GitHub Releases" \
+              --info "license:MIT" \
+              --info "origin:luci-app-fwupdate" \
+              --info "url:https://github.com/novzhhho/luci-app-fwupdate" \
+              --info "maintainer:novzhhho" \
+              --info "depends:libc luci-base curl jsonfilter" \
+              --script "post-install:/w/build/apkscripts/post-install" \
+              --script "post-upgrade:/w/build/apkscripts/post-upgrade" \
+              --files "/w/build/pkgroot" \
+              --output "/w/dist/luci-app-fwupdate-'"$VER"'.apk"
+          '
+          echo '--- 产物 ---'
+          ls -l dist/
+
+      - name: Verify apk metadata
+        run: |
+          set -euo pipefail
+          # adbdump 能把 v3 包完整解出来，能跑通说明结构合法
+          docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -c '
+            set -e
+            apk adbdump /w/dist/*.apk | sed -n "1,60p"
+          '
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.sha }}
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.apk > SHA256SUMS.txt )
+          cat > /tmp/notes.md <<EOF
+          luci-app-fwupdate $VER (commit $TAG)
+
+          纯 shell + JS 的 LuCI 插件，可用 apk 覆盖安装，无需重刷固件：
+          apk add --allow-untrusted --force-overwrite <apk>
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "plugin $TAG ($VER)" --notes-file /tmp/notes.md
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-fwupdate-apk
+          path: dist/*
+          if-no-files-found: error
