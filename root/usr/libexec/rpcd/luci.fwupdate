@@ -339,7 +339,9 @@ do_self_update() {
 
 	after=$(self_local)
 	rm -f "$SELF_CACHE"
-	/etc/init.d/rpcd reload >/dev/null 2>&1
+	# 这里**不能** reload rpcd：本次 ubus 调用正是由它处理的，重启会把回包弄丢，
+	# 前端会看到超时（实测如此）。apk 覆盖后，下一次 call 本来就会用新脚本，
+	# 不需要重启；只有全新安装才需要（由 post-install 负责）。
 
 	json_init
 	json_add_boolean ok 1

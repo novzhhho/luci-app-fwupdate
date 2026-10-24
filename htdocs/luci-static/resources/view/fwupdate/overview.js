@@ -672,7 +672,8 @@ return view.extend({
 	},
 
 	doSelfUpdate: function() {
-		var self = this;
+		var self = this,
+		    prev = (this.refs.selfLocal.textContent || '').trim();
 
 		this.refs.selfUp.disabled = true;
 		this.refs.selfState.textContent = '正在更新…';
@@ -692,9 +693,20 @@ return view.extend({
 
 			window.setTimeout(function() { location.reload(); }, 2000);
 		}, function(e) {
-			self.refs.selfState.textContent = '更新失败';
-			self.refs.selfUp.disabled = false;
-			ui.addNotification(null, E('p', {}, '更新失败：' + e), 'error');
+			/* ubus 调用有超时；万一超时了但包其实已经装上，补查一次本地指纹确认 */
+			return callSelfStatus().then(function(r) {
+				if (r && r.local && self.shortSha(r.local) !== self.shortSha(prev)) {
+					self.refs.selfState.textContent = '已更新到 ' + self.shortSha(r.local) + '，刷新页面生效';
+					ui.addNotification(null,
+						E('p', {}, '插件已更新，页面将在 2 秒后刷新'), 'info');
+					window.setTimeout(function() { location.reload(); }, 2000);
+					return;
+				}
+
+				self.refs.selfState.textContent = '更新失败';
+				self.refs.selfUp.disabled = false;
+				ui.addNotification(null, E('p', {}, '更新失败：' + e), 'error');
+			});
 		});
 	},
 

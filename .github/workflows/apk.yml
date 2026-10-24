@@ -66,12 +66,17 @@ jobs:
           mv "/tmp/$NAME.list" "$ROOT/lib/apk/packages/$NAME.list"
 
           # ---- 安装脚本 ----
+          # 只有「全新安装」需要 reload rpcd（让 ubus 对象注册出来）。
+          # 「升级」时正在处理的调用就是 rpcd，reload 会把回包弄丢，所以留空。
           cat > build/apkscripts/post-install <<'EOS'
           #!/bin/sh
           /etc/init.d/rpcd reload >/dev/null 2>&1
           exit 0
           EOS
-          cp build/apkscripts/post-install build/apkscripts/post-upgrade
+          cat > build/apkscripts/post-upgrade <<'EOS'
+          #!/bin/sh
+          exit 0
+          EOS
           chmod 755 build/apkscripts/post-install build/apkscripts/post-upgrade
 
           echo '--- 打包内容 ---'
