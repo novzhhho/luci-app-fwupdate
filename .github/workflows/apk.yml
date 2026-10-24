@@ -85,6 +85,9 @@ jobs:
           docker run --rm -v "$PWD:/w" -w /w -e SOURCE_DATE_EPOCH=0 alpine:edge sh -c '
             set -e
             apk --version
+            # 宿主 runner 的文件在容器里是 uid 1001（无 passwd 项），mkpkg 会记成
+            # nobody:nogroup；必须先归 0:0，装到路由器上才是 root:root
+            chown -R 0:0 /w/build /w/dist
             apk mkpkg \
               --info "name:luci-app-fwupdate" \
               --info "version:'"$VER"'" \
