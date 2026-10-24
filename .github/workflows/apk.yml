@@ -1,0 +1,115 @@
+name: Plugin APK
+
+# 只编译 luci-app-fwupdate 这一个包，产出一个几 KB 的 apk 并挂到
+# tag=<commit 短 sha> 的 Release 上。路由器里的插件读这个 Release 就能自更新。
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  IW: "25.12.2"
+  IW_TARGET: rockchip/armv8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 需要完整历史才能用 commit 数当 PKG_RELEASE
+
+      - name: Stamp version & build sha
+        id: v
+        run: |
+          set -euo pipefail
+          SHA7=$(git rev-parse --short=7 HEAD)
+          COUNT=$(git rev-list --count HEAD)
+          echo "sha=$SHA7"     >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT"  >> "$GITHUB_OUTPUT"
+          echo "ver=1.0.0-r${COUNT}" >> "$GITHUB_OUTPUT"
+
+          # 烧进包的 commit 指纹：界面显示 + 自更新比对都靠它
+          mkdir -p root/usr/share/luci-app-fwupdate
+          echo "$SHA7" > root/usr/share/luci-app-fwupdate/build
+
+          # 让每次构建的 apk 版本严格递增，apk add 才会真正覆盖安装
+          sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=${COUNT}/" Makefile
+          grep -E '^PKG_(VERSION|RELEASE)' Makefile
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Download SDK
+        run: |
+          set -euo pipefail
+          BASE="https://downloads.immortalwrt.org/releases/${IW}/targets/${IW_TARGET}"
+          curl -fsSL --retry 3 "$BASE/sha256sums" -o /tmp/sums
+          SDK=$(awk -F'[*[:space:]]' '{print $NF}' /tmp/sums \
+                | grep -E '^immortalwrt-sdk-.*\.Linux-x86_64\.tar\.zst$' | head -1)
+          [ -n "$SDK" ] || { echo "::error::sha256sums 里找不到 SDK"; exit 1; }
+          echo "SDK = $SDK"
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/sdk.tar.zst "$BASE/$SDK"
+          rm -rf /tmp/sdk && mkdir -p /tmp/sdk
+          tar --zstd -xf /tmp/sdk.tar.zst -C /tmp/sdk --strip-components=1
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          cd /tmp/sdk
+          ./scripts/feeds update luci
+          ./scripts/feeds install luci
+
+          rm -rf package/luci-app-fwupdate
+          cp -a "$GITHUB_WORKSPACE" package/luci-app-fwupdate
+          rm -rf package/luci-app-fwupdate/.git
+
+          echo 'CONFIG_PACKAGE_luci-app-fwupdate=m' >> .config
+          make defconfig
+          make package/luci-app-fwupdate/compile V=s -j"$(nproc)"
+
+          echo '--- 产物 ---'
+          find bin -name 'luci-app-fwupdate-*.apk' -print
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.sha }}
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rel
+          find /tmp/sdk/bin -name 'luci-app-fwupdate-*.apk' -exec cp -v {} /tmp/rel/ \;
+          ls -l /tmp/rel
+          [ -n "$(ls -A /tmp/rel)" ] || { echo "::error::没找到 apk"; exit 1; }
+          ( cd /tmp/rel && sha256sum *.apk > SHA256SUMS.txt )
+
+          NOTES=$(cat <<EOF
+          luci-app-fwupdate $VER (commit $TAG)
+
+          纯 shell + JS 的 LuCI 插件，改动全部可通过 apk 覆盖安装，不需要重刷固件。
+          EOF
+          )
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" /tmp/rel/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" /tmp/rel/* --repo "$GITHUB_REPOSITORY" \
+              --title "plugin $TAG" --notes "$NOTES"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-fwupdate-apk
+          path: /tmp/rel/*
+          if-no-files-found: error

@@ -3,12 +3,12 @@
 		"description": "Grant access to the fwupdate ubus object",
 		"read": {
 			"ubus": {
-				"luci.fwupdate": [ "status", "check", "log" ]
+				"luci.fwupdate": [ "status", "check", "log", "selfstatus", "selfcheck" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"luci.fwupdate": [ "start", "setconfig" ]
+				"luci.fwupdate": [ "start", "setconfig", "selfupdate" ]
 			}
 		}
 	}

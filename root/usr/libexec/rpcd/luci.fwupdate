@@ -19,6 +19,11 @@ REPO_FALLBACK=/etc/fwupdate-repo
 VER_FILE=/etc/fw-version
 UA='luci-app-fwupdate'
 
+# 插件自身：仓库、构建时写入的 commit 短 sha、以及远端检查缓存
+SELF_REPO='novzhhho/luci-app-fwupdate'
+BUILD_FILE=/usr/share/luci-app-fwupdate/build
+SELF_CACHE=/tmp/fwupdate-self.json
+
 cfg() { uci -q get "fwupdate.main.$1" 2>/dev/null; }
 
 get_repo() {
@@ -233,6 +238,116 @@ do_setconfig() {
 	json_dump
 }
 
+# ---------------------------------------------------------------- 插件自更新
+# 说明：插件是纯 shell + JS，编译产物就是一个几 KB 的 apk。CI 每次 push 都会
+# 构建并把 apk 挂到 tag=<commit 短 sha> 的 Release 上，这里比对本地烧进去的
+# sha 与 Release 的 tag，不同就说明有新版本，直接 apk add 覆盖安装。
+self_local() { tr -d ' \r\n' < "$BUILD_FILE" 2>/dev/null; }
+
+do_self_status() {
+	local local_sha remote has
+
+	local_sha=$(self_local)
+	remote=''; has=0
+
+	if [ -f "$SELF_CACHE" ]; then
+		remote=$(jsonfilter -i "$SELF_CACHE" -e '@.tag' 2>/dev/null)
+		[ -n "$remote" ] && [ "$remote" != "$local_sha" ] && has=1
+	fi
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string local "${local_sha:-dev}"
+	json_add_string remote "$remote"
+	json_add_boolean has_update "$has"
+	json_dump
+}
+
+do_self_check() {
+	local api tmp code tag url size pub local_sha has
+
+	api="https://api.github.com/repos/$SELF_REPO/releases/latest"
+	tmp=/tmp/fwupdate-self-release.json
+	rm -f "$tmp"
+
+	code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+		--retry 2 --connect-timeout 10 -m 30 \
+		-H 'Accept: application/vnd.github+json' \
+		-H "User-Agent: $UA" "$api" 2>/dev/null)
+
+	case "$code" in
+		200) ;;
+		404) reply_err "插件仓库还没有发布过构建（HTTP 404）"; return ;;
+		403) reply_err "GitHub API 被限流（HTTP 403），过几分钟再试"; return ;;
+		''|000) reply_err "连不上 GitHub API（检查路由器网络 / DNS）"; return ;;
+		*) reply_err "GitHub API 返回 HTTP $code"; return ;;
+	esac
+
+	tag=$(jsonfilter -i "$tmp" -e '@.tag_name' 2>/dev/null)
+	[ -n "$tag" ] || { reply_err "解析 Release 失败（没有 tag_name）"; return; }
+
+	url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null \
+		| grep 'luci-app-fwupdate.*\.apk$' | head -n1)
+	[ -n "$url" ] || { reply_err "该 Release 里没有插件 apk"; return; }
+
+	size=$(jsonfilter -i "$tmp" -e "@.assets[@.name=\"${url##*/}\"].size" 2>/dev/null)
+	pub=$(jsonfilter -i "$tmp" -e '@.published_at' 2>/dev/null)
+
+	json_init
+	json_add_string tag "$tag"
+	json_add_string url "$url"
+	json_add_int size "${size:-0}"
+	json_add_string published_at "$pub"
+	json_add_int checked_at "$(date +%s)"
+	json_dump > "$SELF_CACHE"
+	json_cleanup
+
+	local_sha=$(self_local)
+	has=0
+	[ "$tag" != "$local_sha" ] && has=1
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string local "${local_sha:-dev}"
+	json_add_string remote "$tag"
+	json_add_string url "$url"
+	json_add_int size "${size:-0}"
+	json_add_string published_at "$pub"
+	json_add_boolean has_update "$has"
+	json_dump
+}
+
+do_self_update() {
+	local url tmp out rc before after
+
+	url=$(jsonfilter -i "$SELF_CACHE" -e '@.url' 2>/dev/null)
+	[ -n "$url" ] || { reply_err "请先检查插件更新"; return; }
+
+	tmp=/tmp/luci-app-fwupdate-new.apk
+	rm -f "$tmp"
+
+	curl -fsSL --retry 2 --connect-timeout 10 -m 120 -o "$tmp" "$url" 2>/dev/null \
+		|| { rm -f "$tmp"; reply_err "下载插件包失败"; return; }
+	[ -s "$tmp" ] || { rm -f "$tmp"; reply_err "下载到的插件包为空"; return; }
+
+	before=$(self_local)
+	out=$(apk add --no-network --allow-untrusted --force-overwrite "$tmp" 2>&1)
+	rc=$?
+	rm -f "$tmp"
+
+	[ "$rc" = 0 ] || { reply_err "安装失败：$out"; return; }
+
+	after=$(self_local)
+	rm -f "$SELF_CACHE"
+	/etc/init.d/rpcd reload >/dev/null 2>&1
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string before "${before:-dev}"
+	json_add_string after "${after:-dev}"
+	json_dump
+}
+
 # ---------------------------------------------------------------- dispatch
 case "$1" in
 	list)
@@ -249,16 +364,25 @@ case "$1" in
 		json_add_string repo str
 		json_add_string mirror str
 		json_close_object
+		json_add_object selfstatus
+		json_close_object
+		json_add_object selfcheck
+		json_close_object
+		json_add_object selfupdate
+		json_close_object
 		json_dump
 		;;
 	call)
 		case "$2" in
-			status)    do_status ;;
-			check)     do_check ;;
-			log)       do_log ;;
-			start)     do_start ;;
-			setconfig) do_setconfig ;;
-			*)         reply_err "未知方法: $2" ;;
+			status)     do_status ;;
+			check)      do_check ;;
+			log)        do_log ;;
+			start)      do_start ;;
+			setconfig)  do_setconfig ;;
+			selfstatus) do_self_status ;;
+			selfcheck)  do_self_check ;;
+			selfupdate) do_self_update ;;
+			*)          reply_err "未知方法: $2" ;;
 		esac
 		;;
 	*)

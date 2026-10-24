@@ -1,0 +1,6 @@
+# 构建时由 CI 写入当前 commit 短 sha，供界面显示与自更新比对
+root/usr/share/luci-app-fwupdate/build
+
+# 本地构建产物
+*.apk
+*.ipk
