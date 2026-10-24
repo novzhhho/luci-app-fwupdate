@@ -13,8 +13,6 @@ var callSelfStatus = rpc.declare({ object: 'luci.fwupdate', method: 'selfstatus'
 var callSelfCheck  = rpc.declare({ object: 'luci.fwupdate', method: 'selfcheck' });
 var callSelfUpdate = rpc.declare({ object: 'luci.fwupdate', method: 'selfupdate' });
 
-var RING_LEN = 163.4;   /* 2 * PI * 26 */
-
 function fmtSize(n) {
 	n = +n || 0;
 
@@ -38,8 +36,8 @@ function fmtTime(ts) {
 	       p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
-/* 把 r25.12.2-lucky2.27.2-bandix0.12.11-luci0.12.12-uiabc1234 拆成
-   主版本 + 若干组件，界面上分层展示会清爽很多 */
+/* r25.12.2-lucky2.27.2-bandix0.12.11-luci0.12.12-uiabc1234
+   → { main: '25.12.2', subs: ['lucky2.27.2', ...] } */
 function verParts(tag) {
 	tag = (tag || '').replace(/^r(?=[0-9])/, '');
 
@@ -51,92 +49,104 @@ function verParts(tag) {
 	return { main: p[0] || '', subs: p.slice(1) };
 }
 
+/* 样式说明：
+   1. 卡片的背景/圆角/投影全部交给主题的 .cbi-section，行布局交给 .cbi-value，
+      进度条交给 .cbi-progressbar —— 这样在 Argon / Bootstrap / Material 下都原生一致。
+   2. 自定义部分只做「主题没提供的东西」：状态徽章、版本大字、步骤条、日志框。
+      颜色一律取主题变量并带兜底值，深色主题会自动跟随。
+   3. 字号跟主题正文对齐（.875rem = 14px），不再用 11px 这类小字。 */
 var CSS = `
-.fwup{--p:#2f6fed;--p2:#7c5cff;--ok:#12a150;--line:rgba(140,150,170,.30);
-  --bg:rgba(140,150,170,.10);--bg2:rgba(140,150,170,.055);--mut:.62;--r:14px;font-size:13.5px}
-.fwup *{box-sizing:border-box}
-.fwup .hero{position:relative;padding:18px 20px 16px;border:1px solid var(--line);border-radius:var(--r);
-  margin-bottom:16px;overflow:hidden;
-  background:linear-gradient(135deg,rgba(47,111,237,.13),rgba(124,92,255,.07) 55%,transparent 88%)}
-.fwup .hero:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;
-  background:linear-gradient(180deg,var(--p),var(--p2))}
-.fwup .vrow{display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap}
-.fwup .vh{font-size:11px;letter-spacing:.6px;opacity:var(--mut);margin-bottom:5px}
-.fwup .ver{font-size:17px;font-weight:700;letter-spacing:-.3px;line-height:1.25;
-  font-family:ui-monospace,Menlo,Consolas,monospace}
-.fwup .sub{font-size:11.5px;opacity:var(--mut);margin-top:4px;line-height:1.5;max-width:380px;
-  font-family:ui-monospace,Menlo,Consolas,monospace}
-.fwup .arw{opacity:.28;font-size:18px;margin-top:20px}
-.fwup .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px;align-items:center}
-.fwup .chip{font-size:11.5px;padding:4px 9px;border-radius:8px;background:var(--bg);
-  border:1px solid var(--line);opacity:.85}
-.fwup .pill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;
-  padding:4px 11px;border-radius:999px;letter-spacing:.2px}
-.fwup .pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
-.fwup .pill.ok{background:rgba(18,161,80,.15);color:#12995a}
-.fwup .pill.new{background:rgba(217,130,22,.17);color:#c07816}
-.fwup .pill.run{background:rgba(47,111,237,.16);color:#3b76e8}
-.fwup .pill.err{background:rgba(200,60,60,.15);color:#cd4040}
-.fwup .acts{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;align-items:center}
-.fwup .btn{padding:8px 17px;border-radius:9px;font-size:13px;font-weight:600;
-  border:1px solid transparent;cursor:pointer;font-family:inherit;
-  transition:transform .12s,box-shadow .12s,opacity .12s}
-.fwup .btn:active{transform:translateY(1px)}
-.fwup .btn-pri{background:linear-gradient(135deg,var(--p),var(--p2));color:#fff;
-  box-shadow:0 6px 18px -9px rgba(47,111,237,.95)}
-.fwup .btn-pri[disabled]{opacity:.4;box-shadow:none;cursor:not-allowed}
-.fwup .btn-gh{background:transparent;color:inherit;border-color:var(--line)}
-.fwup .btn-gh[disabled]{opacity:.45;cursor:not-allowed}
-.fwup .btn-sm{padding:5px 13px;font-size:12px;border-radius:8px}
-.fwup .card{border:1px solid var(--line);border-radius:var(--r);background:var(--bg2);
-  margin-bottom:16px;overflow:hidden}
-.fwup .hd{display:flex;align-items:center;gap:9px;padding:11px 18px;border-bottom:1px solid var(--line);
-  font-weight:700;font-size:13px}
-.fwup .bd{padding:16px 18px}
-.fwup pre.notes{margin:0;max-height:190px;overflow:auto;white-space:pre-wrap;font-size:12px;
-  line-height:1.66;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px 13px;
-  font-family:ui-monospace,Menlo,Consolas,monospace}
-.fwup .steps{display:flex;margin:2px 0 20px}
-.fwup .st{flex:1;text-align:center;position:relative;font-size:11px;opacity:.45}
-.fwup .st b{position:relative;z-index:1;display:block;width:24px;height:24px;line-height:23px;
-  border-radius:50%;margin:0 auto 6px;background:var(--bg);border:1px solid var(--line);
-  font-weight:700;font-size:11px}
-.fwup .st:after{content:"";position:absolute;top:12px;left:50%;width:100%;height:2px;background:var(--line)}
-.fwup .st:last-child:after{display:none}
-.fwup .st.on{opacity:1;font-weight:700}
-.fwup .st.on b{background:var(--p);border-color:transparent;color:#fff;
-  box-shadow:0 0 0 4px rgba(47,111,237,.18)}
-.fwup .st.done{opacity:.92}
-.fwup .st.done b{background:var(--ok);border-color:transparent;color:#fff}
-.fwup .st.done:after{background:var(--ok)}
-.fwup .prog{display:flex;align-items:center;gap:16px;margin-bottom:14px}
-.fwup .prog .num{font-size:19px;font-weight:700;letter-spacing:-.5px}
-.fwup .prog .lab{font-size:11.5px;opacity:var(--mut);margin-top:3px}
-.fwup pre.con{margin:0;background:#0e1520;color:#c9d7ea;border-radius:10px;padding:11px 13px;
-  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.62;
-  max-height:200px;overflow:auto;white-space:pre-wrap}
-.fwup .row{display:flex;align-items:center;gap:12px;padding:10px 0;
-  border-bottom:1px solid var(--line);flex-wrap:wrap}
-.fwup .row:first-child{padding-top:0}
-.fwup .row:last-child{border-bottom:0;padding-bottom:0}
-.fwup .row .k{width:100px;flex:0 0 auto;opacity:var(--mut);font-size:12.5px}
-.fwup .row .v{flex:1;min-width:140px}
-.fwup code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;background:var(--bg);
-  border:1px solid var(--line);border-radius:6px;padding:1px 6px}
-.fwup details.settings{border:1px solid var(--line);border-radius:var(--r);
-  background:var(--bg2);overflow:hidden}
-.fwup details.settings summary{padding:12px 18px;cursor:pointer;font-weight:700;font-size:13px;
-  list-style:none;outline:none}
-.fwup details.settings summary::-webkit-details-marker{display:none}
-.fwup details.settings summary:before{content:"\\2699";margin-right:8px;opacity:.55}
-.fwup details.settings[open] summary{border-bottom:1px solid var(--line)}
-.fwup .fld{margin-bottom:13px}
-.fwup .fld label{display:block;font-size:12px;opacity:var(--mut);margin-bottom:5px}
-.fwup .fld input{width:100%;max-width:430px;padding:8px 10px;border-radius:9px;
-  border:1px solid var(--line);background:transparent;color:inherit;
-  font-family:inherit;font-size:13px}
-.fwup .fld input:focus{outline:none;border-color:var(--p)}
-.fwup .hint{font-size:11.5px;opacity:var(--mut);margin-top:10px;line-height:1.6}
+.fwup{font-size:.875rem;line-height:1.6}
+.fwup .fw-statusline{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;padding:1.25rem 1.25rem 0}
+.fwup .fw-badge{display:inline-flex;align-items:center;gap:.45rem;padding:.2rem .7rem;border-radius:1rem;
+  font-size:.8125rem;font-weight:600;line-height:1.6;border:1px solid transparent;white-space:nowrap}
+.fwup .fw-badge .fw-dot{flex:0 0 auto;width:.4rem;height:.4rem;border-radius:50%;background:currentColor}
+.fwup .fw-badge.ok{color:var(--success,#2dce89);background:rgba(45,206,137,.12);border-color:rgba(45,206,137,.3)}
+.fwup .fw-badge.new{color:var(--orange,#fb6340);background:rgba(251,99,64,.12);border-color:rgba(251,99,64,.3)}
+.fwup .fw-badge.run{color:var(--primary,#5e72e4);background:rgba(94,114,228,.12);border-color:rgba(94,114,228,.3)}
+.fwup .fw-badge.err{color:var(--danger,#f5365c);background:rgba(245,54,92,.12);border-color:rgba(245,54,92,.3)}
+.fwup .fw-hint{font-size:.875rem;color:var(--gray,#8898aa)}
+.fwup .fw-vers{display:flex;align-items:flex-start;gap:1.25rem;flex-wrap:wrap;padding:1rem 1.25rem 0}
+.fwup .fw-vblock{flex:1 1 15rem;min-width:0}
+.fwup .fw-vlabel{font-size:.875rem;color:var(--gray,#8898aa);margin-bottom:.25rem}
+.fwup .fw-vmain{font-size:1.5rem;font-weight:700;line-height:1.35;letter-spacing:-.01em;word-break:break-word}
+.fwup .fw-vsub{margin-top:.25rem;font-size:.875rem;line-height:1.6;color:var(--gray,#8898aa);
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}
+.fwup .fw-arrow{align-self:center;padding-top:1.2rem;font-size:1.125rem;color:var(--gray,#8898aa);opacity:.7}
+.fwup .fw-meta{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;padding:.875rem 1.25rem 0;
+  font-size:.875rem;color:var(--gray,#8898aa)}
+.fwup .fw-meta .fw-sep{opacity:.55}
+.fwup .fw-acts{display:flex;align-items:center;gap:.625rem;flex-wrap:wrap;margin-top:1rem;
+  padding:1.125rem 1.25rem;border-top:1px solid var(--border-color,#dee2e6)}
+.fwup .fw-body{padding:1.25rem}
+/* 主题的次要按钮是 #f0f0f0 底 + #8898aa 字，对比度偏低；文字改为继承正文色 */
+.fwup .btn:not(.cbi-button-apply){color:inherit}
+.fwup .btn[disabled]{opacity:.5;cursor:not-allowed}
+.fwup .fw-notes{margin:0;padding:1rem 1.125rem;max-height:20rem;overflow:auto;
+  border:1px solid var(--border-color,#dee2e6);border-radius:.25rem;
+  background:rgba(136,152,170,.07);color:inherit;font-size:.875rem;line-height:1.7}
+.fwup .fw-md-h{margin:1.125rem 0 .5rem;font-size:.9375rem;font-weight:700;line-height:1.5}
+.fwup .fw-md-h:first-child{margin-top:0}
+.fwup .fw-md-p{margin:.25rem 0 .75rem}
+.fwup .fw-md-p:last-child{margin-bottom:0}
+.fwup .fw-md-ul{margin:.25rem 0 .75rem;padding-left:1.25rem;list-style:disc}
+.fwup .fw-md-ul li{margin:.2rem 0}
+.fwup .fw-md-table{width:100%;margin:.5rem 0 1rem;border-collapse:collapse;font-size:.875rem}
+.fwup .fw-md-table th:first-child,
+.fwup .fw-md-table td:first-child{width:99%}
+.fwup .fw-md-table th,.fwup .fw-md-table td{padding:.45rem .75rem;text-align:left;
+  border-bottom:1px solid var(--border-color,#dee2e6)}
+.fwup .fw-md-table th{font-weight:600;color:var(--gray,#8898aa);font-size:.8125rem}
+.fwup .fw-md-table tr:last-child td{border-bottom:0}
+.fwup .fw-md-empty{margin:0;color:var(--gray,#8898aa)}
+.fwup .fw-steps{display:flex;margin:0 0 1.25rem;padding:0;list-style:none}
+.fwup .fw-step{position:relative;flex:1;text-align:center;font-size:.8125rem;
+  color:var(--gray,#8898aa);line-height:1.5}
+.fwup .fw-step i{display:block;width:1.75rem;height:1.75rem;margin:0 auto .5rem;
+  border:1px solid var(--border-color,#dee2e6);border-radius:50%;
+  font-style:normal;font-size:.8125rem;font-weight:700;line-height:1.6rem;text-align:center}
+.fwup .fw-step:not(:last-child):after{content:"";position:absolute;top:.8125rem;
+  left:calc(50% + 1.125rem);right:calc(-50% + 1.125rem);height:2px;
+  background:var(--border-color,#dee2e6)}
+.fwup .fw-step.on{color:var(--primary,#5e72e4);font-weight:600}
+.fwup .fw-step.on i{border-color:var(--primary,#5e72e4);background:var(--primary,#5e72e4);color:#fff}
+.fwup .fw-step.done{color:var(--success,#2dce89)}
+.fwup .fw-step.done i{border-color:var(--success,#2dce89);background:var(--success,#2dce89);color:#fff}
+.fwup .fw-step.done:not(:last-child):after{background:var(--success,#2dce89)}
+.fwup .fw-dlinfo{display:flex;align-items:baseline;gap:.625rem;margin:.625rem 0 1.125rem;
+  font-size:.875rem;color:var(--gray,#8898aa)}
+.fwup .fw-dlinfo .fw-pct{font-size:1.125rem;font-weight:700;color:inherit}
+.fwup .fw-console{margin:0;padding:.875rem 1rem;max-height:15rem;overflow:auto;
+  white-space:pre-wrap;word-break:break-word;font-size:.8125rem;line-height:1.7;
+  border:1px solid var(--border-color,#dee2e6);border-radius:.25rem;
+  background:rgba(136,152,170,.08);color:inherit;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+/* 主题给 code 用了 --dark / --lighter，深色主题下会变成深字浅底，这里显式继承 */
+.fwup code{color:inherit;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:.8125rem;padding:.1rem .35rem;border-radius:.25rem;
+  background:rgba(136,152,170,.16)}
+/* 主题默认把行标签排成 23rem 宽右对齐的列，在只有短值的卡片里会显得中空，
+   这里收窄并左对齐；依然沿用主题的字号、行高与配色 */
+.fwup .cbi-value-title{width:11rem;padding-right:1rem;text-align:left;float:none;
+  display:inline-block;vertical-align:middle}
+.fwup .cbi-value-field{display:inline-block;vertical-align:middle;max-width:calc(100% - 11.5rem)}
+.fwup .cbi-value{padding:0 1.25rem}
+.fwup .fw-in{width:100%;max-width:34rem}
+.fwup .fw-details{overflow:hidden}
+.fwup .fw-details>summary{display:flex;align-items:center;gap:.5rem;cursor:pointer;
+  padding:.875rem 1.25rem;font-size:1.1rem;font-weight:700;line-height:1.4;list-style:none}
+.fwup .fw-details>summary::-webkit-details-marker{display:none}
+.fwup .fw-details>summary:before{content:"\\25B8";flex:0 0 auto;font-size:.9rem;
+  color:var(--gray,#8898aa);transition:transform .2s ease}
+.fwup .fw-details[open]>summary:before{transform:rotate(90deg)}
+.fwup .fw-details[open]>summary{border-bottom:1px solid var(--border-color,#dee2e6)}
+@media screen and (max-width:600px){
+  .fwup .fw-arrow{display:none}
+  .fwup .fw-vblock{flex:1 1 100%}
+  .fwup .fw-step{font-size:.75rem}
+  .fwup .cbi-value-title,
+  .fwup .cbi-value-field{display:block;width:100%;max-width:100%;padding-right:0}
+}
 `;
 
 return view.extend({
@@ -151,212 +161,406 @@ return view.extend({
 		});
 	},
 
-	verBlock: function(tag, fallback) {
-		var p = verParts(tag);
+	/* ---------------- 小工具 ---------------- */
 
-		if (!p.main)
-			return [
-				E('div', { class: 'ver' }, fallback),
-				E('div', { class: 'sub' }, ' ')
-			];
-
-		return [
-			E('div', { class: 'ver' }, p.main),
-			E('div', { class: 'sub' }, p.subs.length ? p.subs.join(' · ') : ' ')
-		];
+	shortSha: function(s) {
+		s = (s || '').replace(/[^0-9a-f]/g, '');
+		return s ? s.substring(0, 7) : '';
 	},
 
 	row: function(k, v) {
-		return E('div', { class: 'row' }, [
-			E('span', { class: 'k' }, k),
-			E('span', { class: 'v' }, v)
+		return E('div', { class: 'cbi-value' }, [
+			E('label', { class: 'cbi-value-title' }, k),
+			E('div', { class: 'cbi-value-field' }, v)
 		]);
 	},
+
+	setBadge: function(kind, text, hint) {
+		if (!this.refs)
+			return;
+
+		this.refs.badge.className = 'fw-badge ' + kind;
+		this.refs.badgeTxt.textContent = text;
+		this.refs.hint.textContent = hint || '';
+	},
+
+	setVersions: function(current, latest) {
+		if (!this.refs)
+			return;
+
+		var a = verParts(current),
+		    b = verParts(latest);
+
+		this.refs.curMain.textContent = a.main || '未知';
+		this.refs.curSub.textContent = a.subs.length ? a.subs.join(' · ') : ' ';
+
+		this.refs.newMain.textContent = b.main || '—';
+		this.refs.newSub.textContent = b.main
+			? (b.subs.length ? b.subs.join(' · ') : ' ')
+			: '尚未检查';
+	},
+
+	setMeta: function(o) {
+		var box = this.refs.meta,
+		    items = [];
+
+		o = o || {};
+
+		if (o.size)
+			items.push('镜像 ' + fmtSize(o.size));
+		if (o.published)
+			items.push('发布于 ' + String(o.published).replace('T', ' ').substring(0, 16));
+
+		items.push('上次检查 ' + (o.checked ? fmtTime(o.checked) : '—'));
+
+		while (box.firstChild)
+			box.removeChild(box.firstChild);
+
+		items.forEach(function(t, i) {
+			if (i)
+				box.appendChild(E('span', { class: 'fw-sep' }, '·'));
+			box.appendChild(E('span', {}, t));
+		});
+	},
+
+	showNotes: function(body) {
+		if (!this.refs)
+			return;
+
+		this.renderNotes(body);
+		this.refs.notes.style.display = '';
+	},
+
+	/* Release 说明是 markdown，直接塞进 <pre> 会是一大坨原始符号。
+	   这里只处理实际会出现的几种结构：标题、表格、列表、行内 **加粗** 与 `代码`。 */
+	mdInline: function(text) {
+		var out = [],
+		    re = /(\*\*[^*]+\*\*|`[^`]+`)/g,
+		    last = 0,
+		    m;
+
+		while ((m = re.exec(text)) !== null) {
+			if (m.index > last)
+				out.push(text.substring(last, m.index));
+
+			var tok = m[0];
+
+			if (tok.charAt(0) === '*')
+				out.push(E('strong', {}, tok.slice(2, -2)));
+			else
+				out.push(E('code', {}, tok.slice(1, -1)));
+
+			last = m.index + tok.length;
+		}
+
+		if (last < text.length)
+			out.push(text.substring(last));
+
+		return out;
+	},
+
+	mdCells: function(line) {
+		return line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|')
+			.map(function(c) { return c.trim(); });
+	},
+
+	renderNotes: function(body) {
+		var box = this.refs.notesBody,
+		    lines = String(body || '').replace(/\r/g, '').split('\n'),
+		    self = this,
+		    i = 0,
+		    meaningful = false;
+
+		while (box.firstChild)
+			box.removeChild(box.firstChild);
+
+		while (i < lines.length) {
+			var t = lines[i].trim();
+
+			if (!t) {
+				i++;
+				continue;
+			}
+
+			meaningful = true;
+
+			/* 表格：| a | b | 后面紧跟 |---|---| */
+			if (t.charAt(0) === '|' && i + 1 < lines.length &&
+			    /^\|?[\s:|-]+\|?$/.test(lines[i + 1].trim())) {
+				var head = this.mdCells(t),
+				    rows = [],
+				    table;
+
+				i += 2;
+
+				while (i < lines.length && lines[i].trim().charAt(0) === '|') {
+					rows.push(this.mdCells(lines[i].trim()));
+					i++;
+				}
+
+				table = E('table', { class: 'fw-md-table' }, [
+					E('thead', {}, E('tr', {}, head.map(function(c) {
+						return E('th', {}, c);
+					})))
+				]);
+
+				if (rows.length)
+					table.appendChild(E('tbody', {}, rows.map(function(r) {
+						return E('tr', {}, r.map(function(c) {
+							return E('td', {}, self.mdInline(c));
+						}));
+					})));
+
+				box.appendChild(table);
+				continue;
+			}
+
+			/* 标题 */
+			if (/^#{1,6}\s+/.test(t)) {
+				box.appendChild(E('div', { class: 'fw-md-h' },
+					t.replace(/^#{1,6}\s+/, '')));
+				i++;
+				continue;
+			}
+
+			/* 无序列表 */
+			if (/^[-*]\s+/.test(t)) {
+				var ul = E('ul', { class: 'fw-md-ul' });
+
+				while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
+					ul.appendChild(E('li', {},
+						this.mdInline(lines[i].trim().replace(/^[-*]\s+/, ''))));
+					i++;
+				}
+
+				box.appendChild(ul);
+				continue;
+			}
+
+			/* 普通段落 */
+			box.appendChild(E('p', { class: 'fw-md-p' }, this.mdInline(t)));
+			i++;
+		}
+
+		if (!meaningful)
+			box.appendChild(E('p', { class: 'fw-md-empty' }, '（该 Release 没有写更新说明）'));
+	},
+
+	setSteps: function(phase) {
+		if (!this.refs || this._phase === phase)
+			return;
+
+		this._phase = phase;
+
+		for (var i = 0; i < this.refs.steps.length; i++) {
+			var el = this.refs.steps[i],
+			    cls = 'fw-step';
+
+			if (i < phase)
+				cls += ' done';
+			else if (i === phase)
+				cls += ' on';
+
+			el.className = cls;
+			el.querySelector('i').textContent = (i < phase) ? '✓' : (i + 1);
+		}
+	},
+
+	phaseFromLog: function(t) {
+		if (t.indexOf('开始刷写') >= 0)
+			return 4;
+		if (t.indexOf('sha256') >= 0 || t.indexOf('gzip:') >= 0)
+			return 2;
+		if (t.indexOf('下载:') >= 0 || t.indexOf('固件大小') >= 0)
+			return 1;
+		if (t.indexOf('最新版本') >= 0)
+			return 1;
+		if (t.indexOf('仓库:') >= 0)
+			return 0;
+		return -1;
+	},
+
+	/* ---------------- 渲染 ---------------- */
 
 	render: function(data) {
 		var st = (data && data.st) || null,
 		    sf = (data && data.self) || null,
-		    s = st || {},
-		    self = this;
+		    s = st || {};
 
 		this.status = s;
 		this.latestTag = s.latest || '';
 		this.lastLog = '';
 		this._phase = -1;
 
-		var cur = this.verBlock(s.current, '未知'),
-		    newv = this.verBlock(s.latest, '尚未检查');
-
 		var nodes = [
 			E('style', {}, CSS),
 
-			/* ---------- 头部：版本对比 ---------- */
-			E('div', { class: 'hero' }, [
-				E('div', { class: 'vrow' }, [
-					E('div', {}, [ E('div', { class: 'vh' }, '当前版本') ].concat(cur)),
-					E('div', { class: 'arw' }, '→'),
-					E('div', {}, [ E('div', { class: 'vh' }, '可升级到') ].concat(newv))
-				]),
-				E('div', { class: 'chips' }, [
-					E('span', { class: 'pill ok', id: 'fw-pill' }, [
-						E('span', { class: 'dot' }), E('span', { id: 'fw-pill-txt' }, '待检查')
+			/* ---------- 状态与版本 ---------- */
+			E('div', { class: 'cbi-section' }, [
+				E('h3', {}, '固件升级'),
+
+				E('div', { class: 'fw-statusline' }, [
+					E('span', { class: 'fw-badge ok', id: 'fw-badge' }, [
+						E('span', { class: 'fw-dot' }),
+						E('span', { id: 'fw-badge-txt' }, '待检查')
 					]),
-					E('span', { class: 'chip', id: 'fw-chip-size', style: 'display:none' }, ''),
-					E('span', { class: 'chip', id: 'fw-chip-pub', style: 'display:none' }, ''),
-					E('span', { class: 'chip', id: 'fw-chip-time' }, '上次检查：—')
+					E('span', { class: 'fw-hint', id: 'fw-hint' }, '')
 				]),
-				E('div', { class: 'acts' }, [
+
+				E('div', { class: 'fw-vers' }, [
+					E('div', { class: 'fw-vblock' }, [
+						E('div', { class: 'fw-vlabel' }, '当前版本'),
+						E('div', { class: 'fw-vmain', id: 'fw-cur-main' }, '—'),
+						E('div', { class: 'fw-vsub', id: 'fw-cur-sub' }, ' ')
+					]),
+					E('div', { class: 'fw-arrow' }, '→'),
+					E('div', { class: 'fw-vblock' }, [
+						E('div', { class: 'fw-vlabel' }, '可升级到'),
+						E('div', { class: 'fw-vmain', id: 'fw-new-main' }, '—'),
+						E('div', { class: 'fw-vsub', id: 'fw-new-sub' }, ' ')
+					])
+				]),
+
+				E('div', { class: 'fw-meta', id: 'fw-meta' }),
+
+				E('div', { class: 'fw-acts' }, [
 					E('button', {
-						class: 'btn btn-pri', id: 'fw-up',
+						class: 'btn cbi-button cbi-button-apply', id: 'fw-up',
 						disabled: true,
 						click: ui.createHandlerFn(this, 'handleUpgrade')
 					}, '立即升级'),
 					E('button', {
-						class: 'btn btn-gh', id: 'fw-ck',
+						class: 'btn', id: 'fw-ck',
 						click: ui.createHandlerFn(this, 'handleCheck')
 					}, '检查更新')
 				])
 			]),
 
 			/* ---------- 更新说明 ---------- */
-			E('div', { class: 'card', id: 'fw-notes', style: 'display:none' }, [
-				E('div', { class: 'hd' }, '更新说明'),
-				E('div', { class: 'bd' }, [
-					E('pre', { class: 'notes', id: 'fw-notes-body' }, '')
+			E('div', { class: 'cbi-section', id: 'fw-notes', style: 'display:none' }, [
+				E('h3', {}, '更新说明'),
+				E('div', { class: 'fw-body' }, [
+					E('div', { class: 'fw-notes', id: 'fw-notes-body' })
 				])
 			]),
 
-			/* ---------- 升级进度：四步 + 进度环 + 控制台 ---------- */
-			E('div', { class: 'card', id: 'fw-progress', style: 'display:none' }, [
-				E('div', { class: 'hd' }, '升级进度'),
-				E('div', { class: 'bd' }, [
-					E('div', { class: 'steps', id: 'fw-steps' }, [
-						E('div', { class: 'st', 'data-i': 0 }, [ E('b', {}, '1'), '检查更新' ]),
-						E('div', { class: 'st', 'data-i': 1 }, [ E('b', {}, '2'), '下载镜像' ]),
-						E('div', { class: 'st', 'data-i': 2 }, [ E('b', {}, '3'), '校验镜像' ]),
-						E('div', { class: 'st', 'data-i': 3 }, [ E('b', {}, '4'), '刷写重启' ])
+			/* ---------- 升级进度 ---------- */
+			E('div', { class: 'cbi-section', id: 'fw-progress', style: 'display:none' }, [
+				E('h3', {}, '升级进度'),
+				E('div', { class: 'fw-body' }, [
+					E('ol', { class: 'fw-steps', id: 'fw-steps' }, [
+						E('li', { class: 'fw-step', 'data-i': 0 }, [ E('i', {}, '1'), E('span', {}, '检查更新') ]),
+						E('li', { class: 'fw-step', 'data-i': 1 }, [ E('i', {}, '2'), E('span', {}, '下载镜像') ]),
+						E('li', { class: 'fw-step', 'data-i': 2 }, [ E('i', {}, '3'), E('span', {}, '校验镜像') ]),
+						E('li', { class: 'fw-step', 'data-i': 3 }, [ E('i', {}, '4'), E('span', {}, '刷写重启') ])
 					]),
-					E('div', { class: 'prog' }, [
-						E('svg', { width: 62, height: 62, viewBox: '0 0 62 62' }, [
-							E('circle', {
-								cx: 31, cy: 31, r: 26, fill: 'none',
-								stroke: 'rgba(140,150,170,.3)', 'stroke-width': 6
-							}),
-							E('circle', {
-								id: 'fw-ring', cx: 31, cy: 31, r: 26, fill: 'none',
-								stroke: '#2f6fed', 'stroke-width': 6, 'stroke-linecap': 'round',
-								'stroke-dasharray': RING_LEN, 'stroke-dashoffset': RING_LEN,
-								transform: 'rotate(-90 31 31)'
-							})
-						]),
-						E('div', {}, [
-							E('div', { class: 'num', id: 'fw-pct' }, '0%'),
-							E('div', { class: 'lab', id: 'fw-dl' }, '等待开始')
-						])
+					E('div', { class: 'cbi-progressbar', id: 'fw-bar', title: '' }, [
+						E('div', { id: 'fw-bar-fill', style: 'width:0%' })
 					]),
-					E('pre', { class: 'con', id: 'fw-log' }, '')
+					E('div', { class: 'fw-dlinfo' }, [
+						E('span', { class: 'fw-pct', id: 'fw-pct' }, '0%'),
+						E('span', { id: 'fw-dl' }, '等待开始')
+					]),
+					E('pre', { class: 'fw-console', id: 'fw-log' }, '')
 				])
 			]),
 
 			/* ---------- 插件自身 ---------- */
-			E('div', { class: 'card' }, [
-				E('div', { class: 'hd' }, '插件版本'),
-				E('div', { class: 'bd' }, [
-					this.row('本地构建', E('code', { id: 'fw-self-local' }, this.shortSha(sf && sf.local))),
-					this.row('远端最新', E('code', { id: 'fw-self-remote' }, this.shortSha(sf && sf.remote) || '未检查')),
-					this.row('状态', E('span', { id: 'fw-self-state' }, '—')),
-					this.row('', E('div', { style: 'display:flex;gap:9px;flex-wrap:wrap' }, [
-						E('button', {
-							class: 'btn btn-gh btn-sm', id: 'fw-self-ck',
-							click: ui.createHandlerFn(this, 'handleSelfCheck')
-						}, '检查插件更新'),
-						E('button', {
-							class: 'btn btn-pri btn-sm', id: 'fw-self-up', disabled: true,
-							click: ui.createHandlerFn(this, 'handleSelfUpdate')
-						}, '更新插件')
-					]))
+			E('div', { class: 'cbi-section' }, [
+				E('h3', {}, '插件版本'),
+				E('div', { class: 'cbi-section-descr' },
+					'插件可以单独更新，只需要几秒钟，不会动固件、不会重启。'),
+				this.row('本地构建', E('code', { id: 'fw-self-local' }, this.shortSha(sf && sf.local) || 'dev')),
+				this.row('远端最新', E('code', { id: 'fw-self-remote' }, this.shortSha(sf && sf.remote) || '未检查')),
+				this.row('状态', E('span', { id: 'fw-self-state' }, '—')),
+				E('div', { class: 'cbi-page-actions' }, [
+					E('button', {
+						class: 'btn', id: 'fw-self-ck',
+						click: ui.createHandlerFn(this, 'handleSelfCheck')
+					}, '检查插件更新'),
+					E('button', {
+						class: 'btn cbi-button cbi-button-apply', id: 'fw-self-up', disabled: true,
+						click: ui.createHandlerFn(this, 'handleSelfUpdate')
+					}, '更新插件')
 				])
 			]),
 
 			/* ---------- 高级设置 ---------- */
-			E('details', { class: 'settings' }, [
+			E('details', { class: 'cbi-section fw-details' }, [
 				E('summary', {}, '高级设置'),
-				E('div', { class: 'bd' }, [
-					E('div', { class: 'fld' }, [
-						E('label', {}, 'GitHub 仓库（owner/repo）'),
-						E('input', { id: 'fw-repo', placeholder: 'owner/repo', value: s.repo || '' })
-					]),
-					E('div', { class: 'fld' }, [
-						E('label', {}, '下载加速前缀（可选）'),
-						E('input', { id: 'fw-mirror', placeholder: 'https://ghfast.top/', value: s.mirror || '' })
-					]),
-					E('button', {
-						class: 'btn btn-gh btn-sm',
-						click: ui.createHandlerFn(this, 'handleSaveConfig')
-					}, '保存设置'),
-					E('div', { class: 'hint' },
-						'升级走标准 sysupgrade，默认保留配置；下载完成后会校验 sha256 与 gzip 魔数。')
+				E('div', { class: 'fw-body' }, [
+					this.row('GitHub 仓库', E('input', {
+						class: 'cbi-input-text fw-in', id: 'fw-repo',
+						placeholder: 'owner/repo', value: s.repo || ''
+					})),
+					this.row('下载加速前缀', E('input', {
+						class: 'cbi-input-text fw-in', id: 'fw-mirror',
+						placeholder: 'https://ghfast.top/', value: s.mirror || ''
+					})),
+					E('div', { class: 'fw-hint', style: 'margin-top:.75rem' },
+						'升级走标准 sysupgrade，默认保留配置；下载完成后会校验 sha256 与 gzip 魔数。'),
+					E('div', { class: 'cbi-page-actions', style: 'padding-left:0;padding-right:0' }, [
+						E('button', {
+							class: 'btn cbi-button cbi-button-apply',
+							click: ui.createHandlerFn(this, 'handleSaveConfig')
+						}, '保存设置')
+					])
 				])
 			])
 		];
 
-		this.node = E('div', { class: 'fwup' }, nodes);
+		this.node = E('div', { class: 'cbi-map fwup' }, nodes);
 
 		this.refs = {
-			pill:     this.node.querySelector('#fw-pill'),
-			pillTxt:  this.node.querySelector('#fw-pill-txt'),
-			chipSize: this.node.querySelector('#fw-chip-size'),
-			chipPub:  this.node.querySelector('#fw-chip-pub'),
-			chipTime: this.node.querySelector('#fw-chip-time'),
-			upBtn:    this.node.querySelector('#fw-up'),
-			ckBtn:    this.node.querySelector('#fw-ck'),
-			notes:    this.node.querySelector('#fw-notes'),
-			notesBody:this.node.querySelector('#fw-notes-body'),
-			progCard: this.node.querySelector('#fw-progress'),
-			steps:    this.node.querySelectorAll('#fw-steps .st'),
-			ring:     this.node.querySelector('#fw-ring'),
-			pct:      this.node.querySelector('#fw-pct'),
-			dl:       this.node.querySelector('#fw-dl'),
-			log:      this.node.querySelector('#fw-log'),
-			selfLocal:this.node.querySelector('#fw-self-local'),
+			badge:     this.node.querySelector('#fw-badge'),
+			badgeTxt:  this.node.querySelector('#fw-badge-txt'),
+			hint:      this.node.querySelector('#fw-hint'),
+			curMain:   this.node.querySelector('#fw-cur-main'),
+			curSub:    this.node.querySelector('#fw-cur-sub'),
+			newMain:   this.node.querySelector('#fw-new-main'),
+			newSub:    this.node.querySelector('#fw-new-sub'),
+			meta:      this.node.querySelector('#fw-meta'),
+			upBtn:     this.node.querySelector('#fw-up'),
+			ckBtn:     this.node.querySelector('#fw-ck'),
+			notes:     this.node.querySelector('#fw-notes'),
+			notesBody: this.node.querySelector('#fw-notes-body'),
+			progCard:  this.node.querySelector('#fw-progress'),
+			steps:     this.node.querySelectorAll('#fw-steps .fw-step'),
+			barFill:   this.node.querySelector('#fw-bar-fill'),
+			pct:       this.node.querySelector('#fw-pct'),
+			dl:        this.node.querySelector('#fw-dl'),
+			log:       this.node.querySelector('#fw-log'),
+			selfLocal: this.node.querySelector('#fw-self-local'),
 			selfRemote:this.node.querySelector('#fw-self-remote'),
-			selfState:this.node.querySelector('#fw-self-state'),
-			selfUp:   this.node.querySelector('#fw-self-up'),
-			selfCk:   this.node.querySelector('#fw-self-ck'),
-			repo:     this.node.querySelector('#fw-repo'),
-			mirror:   this.node.querySelector('#fw-mirror')
+			selfState: this.node.querySelector('#fw-self-state'),
+			selfUp:    this.node.querySelector('#fw-self-up'),
+			selfCk:    this.node.querySelector('#fw-self-ck'),
+			repo:      this.node.querySelector('#fw-repo'),
+			mirror:    this.node.querySelector('#fw-mirror')
 		};
 
-		/* 初始状态 */
+		/* ------- 初始状态 ------- */
+		this.setVersions(s.current, s.latest);
+		this.setMeta({ size: s.size, published: s.published_at, checked: s.checked_at });
+
 		if (!st)
-			this.setPill('err', '接口未响应');
+			this.setBadge('err', '接口未响应', '');
 		else if (!s.repo)
-			this.setPill('new', '未配置仓库');
+			this.setBadge('new', '未配置仓库', '请先在下方「高级设置」里填写 GitHub 仓库');
 		else if (s.running) {
-			this.setPill('run', '升级中');
+			this.setBadge('run', '升级中', '正在后台执行，页面会实时刷新进度');
 			this.showProgress();
 			this.startPolling();
 		}
 		else if (s.has_update) {
-			this.setPill('new', '有新版本');
+			this.setBadge('new', '有新版本', '建议升级到最新固件');
 			this.showNotes(s.body);
 			this.refs.upBtn.disabled = false;
 		}
 		else if (s.latest)
-			this.setPill('ok', '已是最新');
+			this.setBadge('ok', '已是最新', '当前已是最新版本，无需升级');
 		else
-			this.setPill('ok', '待检查');
-
-		if (s.checked_at)
-			this.refs.chipTime.textContent = '上次检查：' + fmtTime(s.checked_at);
-		if (s.latest && s.size) {
-			this.refs.chipSize.textContent = '镜像 ' + fmtSize(s.size);
-			this.refs.chipSize.style.display = '';
-		}
-		if (s.published_at) {
-			this.refs.chipPub.textContent = '发布 ' + s.published_at.replace('T', ' ').substring(0, 16);
-			this.refs.chipPub.style.display = '';
-		}
+			this.setBadge('ok', '待检查', '点击「检查更新」查询是否有新版本');
 
 		if (sf) {
 			if (sf.has_update) {
@@ -375,119 +579,50 @@ return view.extend({
 		return this.node;
 	},
 
-	shortSha: function(s) {
-		s = (s || '').replace(/[^0-9a-f]/g, '');
-		return s ? s.substring(0, 7) : '';
-	},
-
-	setPill: function(kind, text) {
-		if (!this.refs || !this.refs.pill)
-			return;
-
-		this.refs.pill.className = 'pill ' + kind;
-		this.refs.pillTxt.textContent = text;
-	},
-
-	showNotes: function(body) {
-		if (!this.refs)
-			return;
-
-		this.refs.notesBody.textContent = (body || '').trim() || '（该 Release 没有写更新说明）';
-		this.refs.notes.style.display = '';
-	},
-
 	showProgress: function() {
 		if (this.refs)
 			this.refs.progCard.style.display = '';
 	},
 
-	/* phase: -1 未开始, 0..3 当前进行到第几步, 4 全部完成（已开始刷写） */
-	setSteps: function(phase) {
-		if (!this.refs || !this.refs.steps || this._phase === phase)
-			return;
-
-		this._phase = phase;
-
-		for (var i = 0; i < this.refs.steps.length; i++) {
-			var el = this.refs.steps[i],
-			    cls = 'st';
-
-			if (i < phase)
-				cls += ' done';
-			else if (i === phase)
-				cls += ' on';
-
-			el.className = cls;
-			el.querySelector('b').textContent = (i < phase) ? '✓' : (i + 1);
-		}
-	},
-
-	phaseFromLog: function(t) {
-		if (t.indexOf('开始刷写') >= 0)
-			return 4;
-		if (t.indexOf('sha256') >= 0 || t.indexOf('gzip:') >= 0)
-			return 2;
-		if (t.indexOf('下载:') >= 0 || t.indexOf('固件大小') >= 0)
-			return 1;
-		if (t.indexOf('最新版本') >= 0)
-			return 1;
-		if (t.indexOf('仓库:') >= 0)
-			return 0;
-		return -1;
-	},
+	/* ---------------- 交互 ---------------- */
 
 	handleCheck: function() {
 		var self = this;
 
 		this.refs.ckBtn.disabled = true;
-		this.setPill('run', '检查中…');
+		this.setBadge('run', '检查中…', '');
 
 		return callCheck().then(function(res) {
 			self.refs.ckBtn.disabled = false;
 
 			if (!res || res.ok === false) {
-				self.setPill('err', '检查失败');
+				self.setBadge('err', '检查失败', '');
 				ui.addNotification(null,
 					E('p', {}, '检查失败：' + ((res && res.error) || '未知错误')), 'error');
 				return;
 			}
 
 			self.latestTag = res.tag;
-			self.refs.chipTime.textContent = '上次检查：' + fmtTime(res.checked_at);
-
-			if (res.size) {
-				self.refs.chipSize.textContent = '镜像 ' + fmtSize(res.size);
-				self.refs.chipSize.style.display = '';
-			}
-			if (res.published_at) {
-				self.refs.chipPub.textContent = '发布 ' + res.published_at.replace('T', ' ').substring(0, 16);
-				self.refs.chipPub.style.display = '';
-			}
-
-			/* 版本块用服务端返回的 tag 刷新 */
-			var box = self.node.querySelector('.vrow'),
-			    blocks = box.querySelectorAll('div > div.ver'),
-			    subs = box.querySelectorAll('div > div.sub'),
-			    p = verParts(res.tag);
-
-			if (blocks.length > 1) {
-				blocks[1].textContent = p.main;
-				subs[1].textContent = p.subs.length ? p.subs.join(' · ') : ' ';
-			}
+			self.setVersions(self.status && self.status.current, res.tag);
+			self.setMeta({
+				size: res.size,
+				published: res.published_at,
+				checked: res.checked_at
+			});
 
 			if (res.has_update) {
-				self.setPill('new', '有新版本');
+				self.setBadge('new', '有新版本', '建议升级到最新固件');
 				self.showNotes(res.body);
 				self.refs.upBtn.disabled = false;
 			}
 			else {
-				self.setPill('ok', '已是最新');
+				self.setBadge('ok', '已是最新', '当前已是最新版本，无需升级');
 				self.refs.notes.style.display = 'none';
 				self.refs.upBtn.disabled = true;
 			}
 		}, function(e) {
 			self.refs.ckBtn.disabled = false;
-			self.setPill('err', '检查失败');
+			self.setBadge('err', '检查失败', '');
 			ui.addNotification(null, E('p', {}, '检查失败：' + e), 'error');
 		});
 	},
@@ -500,10 +635,10 @@ return view.extend({
 			E('p', {}, '即将刷写 ' + tag + '。过程中会断网并自动重启，请全程不要断电。'),
 			E('p', {}, '默认保留现有配置（/etc/config、已装插件的设置）。'),
 			E('div', { class: 'right' }, [
-				E('button', { class: 'btn btn-gh', click: ui.hideModal }, '取消'),
+				E('button', { class: 'btn', click: ui.hideModal }, '取消'),
 				' ',
 				E('button', {
-					class: 'btn btn-pri',
+					class: 'btn cbi-button cbi-button-apply',
 					click: function() {
 						ui.hideModal();
 						self.doStart();
@@ -518,7 +653,7 @@ return view.extend({
 
 		return callStart().then(function(res) {
 			if (!res || res.ok === false) {
-				self.setPill('err', '启动失败');
+				self.setBadge('err', '启动失败', '');
 				ui.addNotification(null,
 					E('p', {}, '启动失败：' + ((res && res.error) || '未知错误')), 'error');
 				return;
@@ -526,12 +661,12 @@ return view.extend({
 
 			self.refs.upBtn.disabled = true;
 			self.refs.log.textContent = '';
-			self.setPill('run', '升级中');
+			self.setBadge('run', '升级中', '正在后台执行，页面会实时刷新进度');
 			self.showProgress();
 			self.setSteps(0);
 			self.startPolling();
 		}, function(e) {
-			self.setPill('err', '启动失败');
+			self.setBadge('err', '启动失败', '');
 			ui.addNotification(null, E('p', {}, '启动失败：' + e), 'error');
 		});
 	},
@@ -576,13 +711,13 @@ return view.extend({
 
 				if (self.lastLog.indexOf('开始刷写') >= 0) {
 					self.setSteps(4);
-					self.setPill('run', '刷写中，即将重启');
+					self.setBadge('run', '刷写中，即将重启', '设备会自动重启，约 2 分钟后恢复');
 				}
 				else if (self.lastLog.indexOf('错误') >= 0) {
-					self.setPill('err', '升级失败');
+					self.setBadge('err', '升级失败', '请查看下方日志');
 				}
 				else {
-					self.setPill('ok', '任务已结束');
+					self.setBadge('ok', '任务已结束', '');
 				}
 			}
 		}, function() {
@@ -608,12 +743,12 @@ return view.extend({
 
 			this.refs.pct.textContent = pct + '%';
 			this.refs.dl.textContent = fmtSize(res.downloaded) + ' / ' + fmtSize(res.total);
-			this.refs.ring.setAttribute('stroke-dashoffset', RING_LEN * (1 - pct / 100));
+			this.refs.barFill.style.width = pct + '%';
 		}
 		else if (this.lastLog.indexOf('开始刷写') >= 0) {
 			this.refs.pct.textContent = '100%';
 			this.refs.dl.textContent = '镜像已就绪，正在刷写';
-			this.refs.ring.setAttribute('stroke-dashoffset', 0);
+			this.refs.barFill.style.width = '100%';
 		}
 	},
 
@@ -647,7 +782,8 @@ return view.extend({
 		}, function(e) {
 			self.refs.selfCk.disabled = false;
 			self.refs.selfState.textContent = '检查失败';
-			ui.addNotification(null, E('p', {}, '检查插件更新失败：' + e), 'error');
+			ui.addNotification(null,
+				E('p', {}, '检查插件更新失败：' + e), 'error');
 		});
 	},
 
@@ -658,10 +794,10 @@ return view.extend({
 			E('p', {}, '将从 GitHub 下载最新构建的插件包并覆盖安装，只需几秒。'),
 			E('p', {}, '不动固件、不重启、不改配置。'),
 			E('div', { class: 'right' }, [
-				E('button', { class: 'btn btn-gh', click: ui.hideModal }, '取消'),
+				E('button', { class: 'btn', click: ui.hideModal }, '取消'),
 				' ',
 				E('button', {
-					class: 'btn btn-pri',
+					class: 'btn cbi-button cbi-button-apply',
 					click: function() {
 						ui.hideModal();
 						self.doSelfUpdate();
@@ -726,8 +862,8 @@ return view.extend({
 
 			self.refs.notes.style.display = 'none';
 			self.refs.upBtn.disabled = true;
-			self.refs.chipTime.textContent = '上次检查：—';
-			self.setPill('ok', '设置已更新，请重新检查');
+			self.setMeta({});
+			self.setBadge('ok', '设置已更新', '请重新点击「检查更新」');
 		}, function(e) {
 			ui.addNotification(null, E('p', {}, '保存失败：' + e), 'error');
 		});
