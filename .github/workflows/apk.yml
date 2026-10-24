@@ -103,6 +103,9 @@ jobs:
               --files "/w/build/pkgroot" \
               --output "/w/dist/luci-app-fwupdate-'"$VER"'.apk"
           '
+          # 容器里 chown 成 root 之后，宿主 runner 就没法往 dist 里写文件了，
+          # 这里再还回来（后面要生成 SHA256SUMS.txt）
+          sudo chown -R "$(id -u):$(id -g)" build dist
           echo '--- 产物 ---'
           ls -l dist/
 
