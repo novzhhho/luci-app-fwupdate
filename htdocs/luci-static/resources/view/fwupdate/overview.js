@@ -36,6 +36,18 @@ function fmtTime(ts) {
 	       p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
+/* 秒数 → 人话。刷完到开机通常几十秒到几分钟，所以只做到分钟。 */
+function fmtDur(s) {
+	s = Math.max(0, +s || 0);
+
+	if (s < 60)
+		return s + ' 秒';
+	if (s < 3600)
+		return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+
+	return Math.floor(s / 3600) + ' 时 ' + Math.floor(s % 3600 / 60) + ' 分';
+}
+
 /* 构建 tag 形如 r25.12.2-lucky2.27.2-bandix0.12.11-bandixweb0.12.12-fw924dec8，
    每段是「名字 + 版本」。原始串直接摊给用户没人看得懂（luci0.12.12 到底是哪个插件的
    哪个部分？），所以这里把已知前缀翻译成人话再显示。
@@ -48,6 +60,23 @@ var SEG_LABEL = {
 	ui:        '升级插件',
 	fw:        '升级插件'
 };
+
+/* 与 /usr/bin/fwupdate 输出的 "#step N state 说明" 一一对应。
+   顺序就是后端执行顺序，改后端时要同步改这里。 */
+var CHECKS = [
+	'检查更新', '下载镜像', '校验镜像', '兼容性预检',
+	'生成配置备份', '容量预检', '刷写'
+];
+
+/* 七步映射到步骤条的五段：预检三小步合并成一段 */
+function phaseOf(n) {
+	if (n >= 7)
+		return 4;
+	if (n >= 4)
+		return 3;
+
+	return n - 1;
+}
 
 function parseTag(tag) {
 	tag = (tag || '').replace(/^r(?=[0-9])/, '');
@@ -199,6 +228,30 @@ var CSS = `
 .fwup .btn:disabled,.fwup .cbi-button:disabled{cursor:not-allowed;pointer-events:none;opacity:.5}
 .fwup .cbi-input-text{font-size:1rem;height:2.5rem}
 
+/* ---------- 上次升级结果 ---------- */
+.fwup .fw-res{display:flex;align-items:flex-start;gap:.6rem;padding:.8rem 1.25rem;
+  font-size:.9375rem;line-height:1.6;border-bottom:1px solid var(--border-color,#dee2e6)}
+.fwup .fw-res-i{flex:0 0 auto;width:1.15rem;height:1.15rem;margin-top:.12rem;border-radius:50%;
+  font-size:.75rem;font-weight:700;line-height:1.15rem;text-align:center;color:#fff}
+.fwup .fw-res.ok .fw-res-i{background:var(--success,#2dce89)}
+.fwup .fw-res.warn .fw-res-i{background:var(--orange,#fb6340)}
+.fwup .fw-res.err .fw-res-i{background:var(--danger,#f5365c)}
+.fwup .fw-res-b{flex:1 1 auto;min-width:0}
+.fwup .fw-res-x{flex:0 0 auto;padding:0 .2rem;font-size:1.1rem;line-height:1;
+  background:none;border:0;color:inherit;opacity:.5;cursor:pointer}
+.fwup .fw-res-x:hover{opacity:1}
+
+/* ---------- 预检清单 ---------- */
+.fwup .fw-checks{margin:0 0 1rem;padding:0;list-style:none;font-size:.9375rem}
+.fwup .fw-checks li{display:flex;align-items:baseline;gap:.55rem;padding:.18rem 0;
+  color:var(--gray,#8898aa);line-height:1.55}
+.fwup .fw-ck-i{flex:0 0 auto;width:1rem;text-align:center;font-weight:700}
+.fwup .fw-ck-n{flex:0 0 6.8rem}
+.fwup .fw-ck-d{flex:1 1 auto;min-width:0;word-break:break-word}
+.fwup .fw-checks li.run{color:var(--primary,#5e72e4);font-weight:600}
+.fwup .fw-checks li.ok{color:var(--success,#2dce89)}
+.fwup .fw-checks li.fail{color:var(--danger,#f5365c);font-weight:600}
+
 /* ---------- 更新说明正文 ---------- */
 .fwup .fw-notes{max-height:15rem;overflow:auto;padding:.875rem 1rem;
   border:1px solid var(--border-color,#dee2e6);border-radius:.25rem;
@@ -323,6 +376,9 @@ return view.extend({
 			items.push('发布于 ' + String(o.published).replace('T', ' ').substring(0, 16));
 
 		items.push('上次检查 ' + (o.checked ? fmtTime(o.checked) : '—'));
+
+		if (o.store)
+			items.push('持久分区可用 ' + fmtSize(o.storeFree));
 
 		while (box.firstChild)
 			box.removeChild(box.firstChild);
@@ -467,6 +523,114 @@ return view.extend({
 			box.appendChild(E('p', { class: 'fw-md-empty' }, '（该 Release 没有写更新说明）'));
 	},
 
+	/* 上次升级的自证结论。数据来自开机脚本写的 result.json，
+	   由后端 status 的 last_* 字段带上来。没有就整行不显示。 */
+	renderLast: function(s) {
+		var st = s && s.last_status;
+
+		if (!st || !this.refs || !this.refs.fwRes)
+			return;
+
+		var kind, icon, body = [];
+
+		if (st === 'ok') {
+			kind = 'ok'; icon = '✓';
+			body.push(E('b', {}, '上次升级成功'), '：' + (s.last_from || '?') + ' → ' + (s.last_to || '?'));
+
+			if (s.last_total)
+				body.push(' · 配置 ' + s.last_ok + '/' + s.last_total + ' 项全部到位');
+			if (s.last_changed)
+				body.push('（其中 ' + s.last_changed + ' 项被服务启动时改写，属正常）');
+			if (s.last_store)
+				body.push(' · 完整资源已从持久分区补回');
+		}
+		else if (st === 'partial') {
+			kind = 'warn'; icon = '!';
+			body.push(E('b', {}, '上次升级已完成，但有 ' + s.last_missing + ' 项配置没能恢复'),
+				'：' + (s.last_from || '?') + ' → ' + (s.last_to || '?'));
+		}
+		else if (st === 'notapplied') {
+			kind = 'err'; icon = '×';
+			body.push(E('b', {}, '上次升级没有生效'), '：版本仍是 ' + (s.last_from || '?') +
+				'，建议重新执行一次升级');
+		}
+		else {
+			kind = 'warn'; icon = '?';
+			body.push(E('b', {}, '上次升级后的版本与预期不一致'),
+				'：期望 ' + (s.last_to || '?') + '，当前 ' + (s.current || '?'));
+		}
+
+		if (s.last_elapsed)
+			body.push(' · 从写入到开机用时 ' + fmtDur(s.last_elapsed));
+
+		this.refs.fwRes.className = 'fw-res ' + kind;
+		this.refs.fwResI.textContent = icon;
+		this.refs.fwResT.textContent = '';
+
+		body.forEach(function(x) {
+			this.refs.fwResT.appendChild(typeof x === 'string' ? document.createTextNode(x) : x);
+		}, this);
+
+		this.refs.fwRes.style.display = '';
+	},
+
+	/* ---------------- 预检清单 ---------------- */
+
+	paintChecks: function() {
+		if (!this.refs || !this.refs.checks)
+			return;
+
+		for (var i = 0; i < this.refs.checks.length; i++) {
+			var n = i + 1,
+			    el = this.refs.checks[i],
+			    st = this._ckState[n] || '',
+			    msg = this._ckMsg[n] || '等待';
+
+			el.className = st;
+			el.children[0].textContent =
+				st === 'ok' ? '✓' : (st === 'fail' ? '✗' : (st === 'running' ? '…' : '·'));
+			el.children[2].textContent = msg;
+		}
+	},
+
+	/* 从日志里解析 "#step N state 说明"。
+	   这是后端与界面之间唯一的进度契约，比在文本里搜关键字可靠得多。 */
+	applyMarkers: function(txt) {
+		var re = /#step (\d+) (running|ok|fail)(?: ([^\n]*))?/g,
+		    m, changed = false, last = 0, lastState = '';
+
+		while ((m = re.exec(txt)) !== null) {
+			var n = +m[1],
+			    st = m[2],
+			    msg = (m[3] || '').trim();
+
+			if (n < 1 || n > CHECKS.length)
+				continue;
+
+			if (this._ckState[n] !== st || (msg && this._ckMsg[n] !== msg)) {
+				this._ckState[n] = st;
+				if (msg)
+					this._ckMsg[n] = msg;
+				changed = true;
+			}
+
+			if (n >= last) {
+				last = n;
+				lastState = st;
+			}
+		}
+
+		if (changed)
+			this.paintChecks();
+
+		if (last) {
+			this.setSteps(last === CHECKS.length && lastState === 'ok' ? 5 : phaseOf(last));
+
+			if (last === CHECKS.length && lastState === 'running')
+				this._flashing = true;
+		}
+	},
+
 	setSteps: function(phase) {
 		if (!this.refs || this._phase === phase)
 			return;
@@ -487,20 +651,6 @@ return view.extend({
 		}
 	},
 
-	phaseFromLog: function(t) {
-		if (t.indexOf('开始刷写') >= 0)
-			return 4;
-		if (t.indexOf('sha256') >= 0 || t.indexOf('gzip:') >= 0)
-			return 2;
-		if (t.indexOf('下载:') >= 0 || t.indexOf('固件大小') >= 0)
-			return 1;
-		if (t.indexOf('最新版本') >= 0)
-			return 1;
-		if (t.indexOf('仓库:') >= 0)
-			return 0;
-		return -1;
-	},
-
 	/* ---------------- 渲染 ---------------- */
 
 	render: function(data) {
@@ -513,6 +663,9 @@ return view.extend({
 		this.latestTag = s.latest || '';
 		this.lastLog = '';
 		this._phase = -1;
+		this._ckState = {};
+		this._ckMsg = {};
+		this._flashing = false;
 
 		/* 整页只有一张卡片，内容用分隔线分区 */
 		var card = E('div', { class: 'cbi-section' }, [
@@ -535,6 +688,16 @@ return view.extend({
 						click: ui.createHandlerFn(this, 'handleUpgrade')
 					}, '立即升级')
 				])
+			]),
+
+			/* 上次升级结果（开机自证的结论，没有就整行隐藏） */
+			E('div', { class: 'fw-res', id: 'fw-res', style: 'display:none' }, [
+				E('span', { class: 'fw-res-i', id: 'fw-res-i' }, '✓'),
+				E('div', { class: 'fw-res-b', id: 'fw-res-t' }),
+				E('button', {
+					class: 'fw-res-x', id: 'fw-res-x', title: '关闭',
+					click: function() { this.parentNode.style.display = 'none'; }
+				}, '×')
 			]),
 
 			/* 版本 */
@@ -566,8 +729,16 @@ return view.extend({
 					E('li', { class: 'fw-step', 'data-i': 0 }, [ E('i', {}, '1'), E('span', {}, '检查更新') ]),
 					E('li', { class: 'fw-step', 'data-i': 1 }, [ E('i', {}, '2'), E('span', {}, '下载镜像') ]),
 					E('li', { class: 'fw-step', 'data-i': 2 }, [ E('i', {}, '3'), E('span', {}, '校验镜像') ]),
-					E('li', { class: 'fw-step', 'data-i': 3 }, [ E('i', {}, '4'), E('span', {}, '刷写重启') ])
+					E('li', { class: 'fw-step', 'data-i': 3 }, [ E('i', {}, '4'), E('span', {}, '预检备份') ]),
+					E('li', { class: 'fw-step', 'data-i': 4 }, [ E('i', {}, '5'), E('span', {}, '刷写重启') ])
 				]),
+				E('ul', { class: 'fw-checks', id: 'fw-checks' }, CHECKS.map(function(name, i) {
+					return E('li', { 'data-n': i + 1 }, [
+						E('span', { class: 'fw-ck-i' }, '·'),
+						E('span', { class: 'fw-ck-n' }, name),
+						E('span', { class: 'fw-ck-d' }, '等待')
+					]);
+				})),
 				E('div', { class: 'cbi-progressbar', id: 'fw-bar', title: '' }, [
 					E('div', { id: 'fw-bar-fill', style: 'width:0%' })
 				]),
@@ -621,7 +792,9 @@ return view.extend({
 					})),
 					this.field('构建标识', E('code', { id: 'fw-rawtag' }, '—')),
 					E('div', { class: 'fw-hint', style: 'margin:.5rem 0 .75rem' },
-						'升级走标准 sysupgrade，默认保留配置；下载完成后校验 sha256 与 gzip 魔数。'),
+						'升级走标准 sysupgrade，配置由本插件自行打包后用 -f 指定，' +
+						'不再使用系统默认备份（那会把 /etc/openclash 的 55 MB 资源一起打进去，' +
+						'超过 p1 分区 9 MB 的可用空间）。'),
 					E('div', { class: 'cbi-page-actions', style: 'padding:0;justify-content:flex-start' }, [
 						E('button', {
 							class: 'btn cbi-button cbi-button-apply',
@@ -640,6 +813,10 @@ return view.extend({
 		this.refs = {
 			badge:     this.node.querySelector('#fw-badge'),
 			badgeTxt:  this.node.querySelector('#fw-badge-txt'),
+			fwRes:     this.node.querySelector('#fw-res'),
+			fwResI:    this.node.querySelector('#fw-res-i'),
+			fwResT:    this.node.querySelector('#fw-res-t'),
+			checks:    this.node.querySelectorAll('#fw-checks li'),
 			curMain:   this.node.querySelector('#fw-cur-main'),
 			curSub:    this.node.querySelector('#fw-cur-sub'),
 			newMain:   this.node.querySelector('#fw-new-main'),
@@ -669,7 +846,11 @@ return view.extend({
 
 		/* ------- 初始状态 ------- */
 		this.setVersions(s.current, s.latest);
-		this.setMeta({ size: s.size, published: s.published_at, checked: s.checked_at });
+		this.setMeta({
+			size: s.size, published: s.published_at, checked: s.checked_at,
+			store: s.store, storeFree: s.store_free
+		});
+		this.renderLast(s);
 
 		if (!st)
 			this.setBadge('err', '接口未响应');
@@ -737,7 +918,9 @@ return view.extend({
 			self.setMeta({
 				size: res.size,
 				published: res.published_at,
-				checked: res.checked_at
+				checked: res.checked_at,
+				store: self.status && self.status.store,
+				storeFree: self.status && self.status.store_free
 			});
 
 			if (res.has_update) {
@@ -763,7 +946,9 @@ return view.extend({
 
 		ui.showModal('确认升级固件', [
 			E('p', {}, '即将刷写 ' + tag + '。过程中会断网并自动重启，请全程不要断电。'),
-			E('p', {}, '默认保留现有配置（/etc/config、已装插件的设置）。'),
+			E('p', {}, '刷写前会依次完成 7 项检查：下载、双源 sha256、机型与分区表匹配、' +
+				'配置备份、p1 容量校验。任何一项不过都会自动中止，不会动你的系统。'),
+			E('p', {}, '现有配置会被完整保留；OpenClash 的规则与订阅也在其中。'),
 			E('div', { class: 'right' }, [
 				E('button', { class: 'btn', click: ui.hideModal }, '取消'),
 				' ',
@@ -839,18 +1024,70 @@ return view.extend({
 			if (!res.running) {
 				self.stopPolling();
 
-				if (self.lastLog.indexOf('开始刷写') >= 0) {
+				/* 日志是 tail 出来的，刷写开始后 sysupgrade 会刷一大堆输出，
+				   可能把 "#step 7" 那行挤掉；所以再按关键字兜一次底 */
+				var txt = self.lastLog || '';
+				var flashing = self._flashing ||
+					/Commencing upgrade|刷写期间不要断电/.test(txt);
+
+				if (flashing) {
+					/* 刷写已经开始，设备随时会断。别报「失败」，直接进入重连探测 */
 					self.setSteps(4);
-					self.setBadge('run', '刷写中，即将重启');
+					self.setBadge('run', '刷写中，设备即将重启');
+					self.startReconnect();
 				}
-				else if (self.lastLog.indexOf('错误') >= 0)
-					self.setBadge('err', '升级失败，见下方日志');
+				else if (self.failedStep()) {
+					self.setBadge('err', '预检未通过，见下方原因');
+				}
 				else
 					self.setBadge('ok', '任务已结束');
 			}
 		}, function() {
+			/* ubus 调不通：多半是设备正在重启。若已在刷写阶段，转为探测重连 */
 			self.stopPolling();
+
+			if (self._flashing) {
+				self.setBadge('run', '设备正在重启…');
+				self.startReconnect();
+			}
 		});
+	},
+
+	/* 哪一步失败了（有 fail 标记就返回步号，否则 0） */
+	failedStep: function() {
+		for (var i = 1; i <= CHECKS.length; i++)
+			if (this._ckState[i] === 'fail')
+				return i;
+
+		return 0;
+	},
+
+	/* 刷写后设备会重启、会话会失效，所以这里只负责「发现它回来了」，
+	   不自动跳转 —— 直接刷新会落到登录页，看起来像出错。 */
+	startReconnect: function() {
+		var self = this;
+
+		if (this._probe)
+			return;
+
+		this._probe = window.setInterval(function() {
+			fetch(window.location.pathname + '?_=' + Date.now(), {
+				method: 'GET', cache: 'no-store', credentials: 'same-origin'
+			}).then(function(r) {
+				if (!r.ok)
+					return;
+
+				window.clearInterval(self._probe);
+				self._probe = null;
+
+				self.setBadge('ok', '设备已重启完成');
+				ui.addNotification(null, E('p', {}, [
+					'固件已刷写完成，设备重新上线。',
+					E('br'),
+					'刷新页面并重新登录，即可看到本次升级的自证结果（恢复了多少项配置）。'
+				]), 'info');
+			}).catch(function() { /* 还没起来，下次再试 */ });
+		}, 5000);
 	},
 
 	renderLog: function(res) {
@@ -861,9 +1098,7 @@ return view.extend({
 			this.refs.log.textContent = txt || '（暂无输出）';
 			this.refs.log.scrollTop = this.refs.log.scrollHeight;
 
-			var ph = this.phaseFromLog(txt);
-			if (ph >= 0)
-				this.setSteps(ph);
+			this.applyMarkers(txt);
 		}
 
 		if (res.total > 0) {
@@ -873,7 +1108,7 @@ return view.extend({
 			this.refs.dl.textContent = fmtSize(res.downloaded) + ' / ' + fmtSize(res.total);
 			this.refs.barFill.style.width = pct + '%';
 		}
-		else if (this.lastLog.indexOf('开始刷写') >= 0) {
+		else if (/Commencing upgrade|刷写期间不要断电/.test(this.lastLog)) {
 			this.refs.pct.textContent = '100%';
 			this.refs.dl.textContent = '镜像已就绪，正在刷写';
 			this.refs.barFill.style.width = '100%';

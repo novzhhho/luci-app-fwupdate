@@ -53,6 +53,7 @@ jobs:
           install -D -m644 root/usr/share/rpcd/acl.d/luci-app-fwupdate.json       "$ROOT/usr/share/rpcd/acl.d/luci-app-fwupdate.json"
           install -D -m600 root/etc/config/fwupdate                               "$ROOT/etc/config/fwupdate"
           install -D -m755 root/etc/uci-defaults/95_luci-app-fwupdate             "$ROOT/etc/uci-defaults/95_luci-app-fwupdate"
+          install -D -m755 root/etc/uci-defaults/97_luci-app-fwupdate-verify      "$ROOT/etc/uci-defaults/97_luci-app-fwupdate-verify"
           install -D -m644 htdocs/luci-static/resources/view/fwupdate/overview.js "$ROOT/www/luci-static/resources/view/fwupdate/overview.js"
 
           # ---- 构建指纹：界面显示 + 自更新比对 ----

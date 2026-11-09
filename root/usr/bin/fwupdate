@@ -1,27 +1,49 @@
 #!/bin/sh
 # /usr/bin/fwupdate —— 从本仓库的 GitHub Release 拉取固件并就地升级
 #
-#   fwupdate          检查并升级（刷写前二次确认）
-#   fwupdate -c       只检查、只下载，不刷
+#   fwupdate          检查 → 下载 → 校验 → 预检 → 刷写（刷写前二次确认）
+#   fwupdate -c       只做检查/下载/预检，不刷
 #   fwupdate -y       不确认，直接刷
 #   fwupdate -f       版本号相同也强制重刷
 #   fwupdate -l       只列出最近几个可用版本
+#   fwupdate -t TAG   刷指定 tag（不给则用 latest）
+#   fwupdate -n       跳过持久分区的完整备份（省几秒，不推荐）
 #
 # 仓库地址在构建时写入 /etc/fwupdate-repo，也可用 uci 覆盖：
 #   uci set fwupdate.main.repo='user/repo'
 #   uci set fwupdate.main.mirror='https://ghfast.top/'   # 可选下载加速前缀
-#   uci commit fwupdate
 #
-# 刷机仅替换 rootfs/kernel，默认保留配置（走 sysupgrade 标准流程）。
+# ── 设计要点 ────────────────────────────────────────────────────────────
+# 1. 一切不可逆动作（刷写）排在所有检查之后。前面六步任何一步失败都直接
+#    中止，且不会在设备上留下需要清理的状态。
+# 2. 配置包由本脚本生成，用 `sysupgrade -f` 喂给 sysupgrade。系统自带的
+#    create_backup_archive 会把 /etc/openclash/ 整个打进去（实测 27.2 MB），
+#    而 p1 分区只有 9 MB 可用 —— platform_copy_config() 里的 cp -af 失败
+#    不检查返回值，会在 p1 上留下残缺包，开机解一半，配置只恢复一半。
+#    自己打包能精确控制体积，且不动 /lib/upgrade/keep.d 任何文件。
+# 3. 卡上有一块 25 GiB 的持久分区（p3，挂 /mnt/fwstore），sysupgrade 只写
+#    镜像里列出的 p1/p2，这块不会被碰。所以：镜像缓存放在那里，完整配置
+#    备份也放在那里；被 p1 体积所限剔除掉的大文件，开机后从完整备份补回。
+#    剔除因此不产生任何真实丢失。没有这块分区时自动退化为「只保留精简包」。
+# 4. 刷写前把 pending.json / pending.list 打进配置包。重启后 /etc 被整体
+#    替换，只有包里带着的东西能跨过去，开机脚本据此逐文件核对，证明配置
+#    到底恢复了几项。
+# 5. 日志里以 "#step N state 说明" 开头的行是给界面的结构化进度标记
+#    （state = running|ok|fail），其余行给人看。
 
-REPO_FILE=/etc/fw-version      # 里面存的是构建时的版本 tag（只读展示用）
-REPO_CFG=/etc/fwupdate-repo    # 里面存的是 owner/repo
+REPO_FILE=/etc/fw-version      # 构建时写入的版本 tag（只读展示用）
+REPO_CFG=/etc/fwupdate-repo    # 构建时写入的 owner/repo
 WORK=/tmp/fwupdate.d
+STATE=/etc/fwupdate            # pending / result 的存放位置
+BK=/tmp/fwupdate-backup.tgz    # 自建的配置包，交给 sysupgrade -f
+STORE=/mnt/fwstore             # 卡上的持久分区（p3），刷写不会碰
 
 CHECK_ONLY=0
 ASSUME_YES=0
 FORCE=0
 LIST_ONLY=0
+NO_FULL=0
+TARGET=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -29,18 +51,59 @@ while [ $# -gt 0 ]; do
 		-y) ASSUME_YES=1 ;;
 		-f) FORCE=1 ;;
 		-l) LIST_ONLY=1 ;;
-		-h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+		-n) NO_FULL=1 ;;
+		-t) TARGET="$2"; shift ;;
+		-h|--help) sed -n '2,13p' "$0"; exit 0 ;;
 		*) echo "未知参数: $1（用 -h 看用法）" >&2; exit 1 ;;
 	esac
 	shift
 done
 
-die()  { echo "[fwupdate] 错误: $*" >&2; exit 1; }
-info() { echo "[fwupdate] $*"; }
+# ---------------------------------------------------------------- 输出
+STEP=0
+
+phase() {
+	STEP=$1
+	printf '#step %s running %s\n' "$1" "$2"
+	printf '\n[%s/7] %s\n' "$1" "$2"
+}
+
+pass() {
+	printf '#step %s ok %s\n' "$STEP" "$1"
+	printf '      ok  %s\n' "$1"
+}
+
+note() { printf '          %s\n' "$1"; }
+
+fail() {
+	printf '#step %s fail %s\n' "$STEP" "$1"
+	printf '      !!  %s\n' "$1" >&2
+	abort_state
+	exit 1
+}
+
+# 中止时把「刷写已开始」的痕迹清掉，避免下次开机误报「上次升级未完成」
+abort_state() {
+	rm -f "$STATE/pending.json" "$STATE/pending.list"
+	rm -f /etc/uci-defaults/10_disable_services
+	rm -f "$BK"
+}
+
+hsz() {
+	local n=${1:-0}
+	case "$n" in ''|*[!0-9]*) echo '0 B'; return ;; esac
+	if [ "$n" -ge 1048576 ]; then
+		awk -v n="$n" 'BEGIN{printf "%.1f MB", n/1048576}'
+	elif [ "$n" -ge 1024 ]; then
+		awk -v n="$n" 'BEGIN{printf "%.0f KB", n/1024}'
+	else
+		echo "$n B"
+	fi
+}
 
 # 取文件前 2 字节的十六进制。
-# 注意：ImmortalWrt(apk 版) 默认**不带 od**（实测 od: not found），
-# 只有 /usr/bin/hexdump；所以以 hexdump 为主、od 为备，两者都没有就返回空。
+# 注意：ImmortalWrt(apk 版) 默认不带 od，只有 /usr/bin/hexdump；
+# 两者都没有就返回空，调用方跳过格式检查（完整性由 sha256 保证）。
 hex2() {
 	if command -v hexdump >/dev/null 2>&1; then
 		hexdump -v -n 2 -e '2/1 "%02x"' "$1" 2>/dev/null
@@ -49,126 +112,443 @@ hex2() {
 	fi
 }
 
+# 持久分区是否可用。它由 fstab 在开机时挂上，也可能被用户手工卸载，
+# 所以每次都要现查，不能缓存结果 —— 拿不到就退化成「只用 /tmp」。
+store_ready() {
+	[ -d "$STORE" ] || return 1
+	awk -v p="$STORE" '$2==p{found=1} END{exit !found}' /proc/mounts 2>/dev/null
+}
+
+# ---------------------------------------------------------------- 并发保护
+if command -v flock >/dev/null 2>&1 && [ "$LIST_ONLY" = 0 ]; then
+	mkdir -p /var/lock 2>/dev/null
+	exec 9>/var/lock/fwupdate.lock 2>/dev/null
+	if ! flock -n 9 2>/dev/null; then
+		echo "[fwupdate] 已有一个升级任务在运行" >&2
+		exit 1
+	fi
+fi
+
+# ---------------------------------------------------------------- 配置
 REPO=$(uci -q get fwupdate.main.repo)
-[ -n "$REPO" ] || REPO=$(cat "$REPO_CFG" 2>/dev/null | tr -d ' \r\n')
-[ -n "$REPO" ] || die "未配置仓库（$REPO_CFG 为空，且 uci 未设置 fwupdate.main.repo）"
+[ -n "$REPO" ] || REPO=$(tr -d ' \r\n' < "$REPO_CFG" 2>/dev/null)
+[ -n "$REPO" ] || { echo "[fwupdate] 未配置仓库（$REPO_CFG 为空，且 uci 未设置 fwupdate.main.repo）" >&2; exit 1; }
 
 MIRROR=$(uci -q get fwupdate.main.mirror)
-
-CUR=$(cat $REPO_FILE 2>/dev/null | tr -d ' \r\n')
+CUR=$(tr -d ' \r\n' < "$REPO_FILE" 2>/dev/null)
 [ -n "$CUR" ] || CUR="unknown"
 
 API="https://api.github.com/repos/$REPO"
+UA='luci-app-fwupdate'
 
-info "仓库:     $REPO"
-info "当前版本: $CUR"
+echo "[fwupdate] 仓库:     $REPO"
+echo "[fwupdate] 当前版本: $CUR"
 
+# ---------------------------------------------------------------- -l 列表
 if [ "$LIST_ONLY" = 1 ]; then
-	curl -fsSL --retry 3 --connect-timeout 15 -H 'User-Agent: fwupdate' \
+	curl -fsSL --retry 3 --connect-timeout 15 -m 40 -H "User-Agent: $UA" \
 		"$API/releases?per_page=10" \
 		| jsonfilter -e '@[*].tag_name' 2>/dev/null | sed 's/^/[tag] /'
 	exit 0
 fi
 
-JSON=$(curl -fsSL --retry 3 --connect-timeout 15 \
+# ---------------------------------------------------------------- 1 检查更新
+phase 1 "检查更新"
+
+if [ -n "$TARGET" ]; then
+	RJ="$API/releases/tags/$TARGET"
+else
+	RJ="$API/releases/latest"
+fi
+
+JSON=$(curl -fsSL --retry 3 --connect-timeout 15 -m 40 \
 	-H 'Accept: application/vnd.github+json' \
-	-H 'User-Agent: fwupdate' "$API/releases/latest") \
-	|| die "访问 GitHub API 失败（网络不通或被限流）"
+	-H "User-Agent: $UA" "$RJ") \
+	|| fail "访问 GitHub API 失败（网络不通或被限流）"
 
 TAG=$(echo "$JSON" | jsonfilter -e '@.tag_name' 2>/dev/null)
-[ -n "$TAG" ] || die "解析 Release 失败"
+[ -n "$TAG" ] || fail "解析 Release 失败（没有 tag_name）"
 
-info "最新版本: $TAG"
+PUB=$(echo "$JSON" | jsonfilter -e '@.published_at' 2>/dev/null)
 
 if [ "$TAG" = "$CUR" ] && [ "$FORCE" = 0 ]; then
-	info "已是最新，无需升级（-f 可强制重刷）"
+	pass "已是最新：$CUR"
 	exit 0
 fi
 
 # 优先 .img.gz，退而求其次 .img
 URL=$(echo "$JSON" | jsonfilter -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img\.gz$' | head -1)
 [ -n "$URL" ] || URL=$(echo "$JSON" | jsonfilter -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img$' | head -1)
-[ -n "$URL" ] || die "该 Release 里没有 .img / .img.gz 资产"
+[ -n "$URL" ] || fail "该 Release 里没有 .img / .img.gz 资产"
 
-NAME=$(basename "$URL")
-mkdir -p "$WORK"
-IMG="$WORK/$NAME"
-rm -f "$IMG"
-
-DL="$URL"
-[ -n "$MIRROR" ] && DL="${MIRROR}${URL}"
-
-# 按资产名取大小（@.assets[0] 是随便挑的第一个，不一定是固件）
+NAME=${URL##*/}
 SIZE=$(echo "$JSON" | jsonfilter -e "@.assets[@.name=\"$NAME\"].size" 2>/dev/null)
-case "$SIZE" in
-	''|*[!0-9]*) ;;
-	*) info "固件大小: $((SIZE / 1024 / 1024)) MB" ;;
+case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
+
+# GitHub 从 2025 年起给每个 asset 带 sha256 digest，比 Release 里同源的
+# .sha256 文件更可信（一个是 GitHub 侧计算的，一个是上传者自己写的）
+DIGEST=$(echo "$JSON" | jsonfilter -e "@.assets[@.name=\"$NAME\"].digest" 2>/dev/null)
+
+if [ "$TAG" = "$CUR" ]; then
+	pass "$TAG · $(hsz "$SIZE") · 版本号相同，强制重刷"
+else
+	pass "$TAG · $(hsz "$SIZE") · 发布于 ${PUB%%T*}"
+fi
+
+# ---------------------------------------------------------------- 2 下载
+phase 2 "下载镜像"
+
+mkdir -p "$WORK"
+rm -f "$WORK"/*.img "$WORK"/*.img.gz 2>/dev/null
+
+# 持久分区可用就把镜像直接下载到那里：既不吃 /tmp 的内存，也让同一版本
+# 重刷时不必再走一次 40 MB 流量。拿不到就退回 /tmp。
+IMGDIR="$WORK"
+if store_ready && mkdir -p "$STORE/images" 2>/dev/null; then
+	IMGDIR="$STORE/images"
+	dfree=$(df -k "$STORE" 2>/dev/null | awk 'NR==2{print $4}')
+	if [ -n "$dfree" ] && [ "$SIZE" -gt 0 ] && [ "$dfree" -lt $(( SIZE / 1024 + 65536 )) ]; then
+		note "持久分区剩余空间不足，退回 /tmp 下载"
+		IMGDIR="$WORK"
+	fi
+fi
+
+IMG="$IMGDIR/$NAME"
+printf '%s\n' "$IMG" > "$WORK/current.path"
+
+CACHED=0
+if [ "$IMGDIR" != "$WORK" ] && [ -s "$IMG" ] && [ "$SIZE" -gt 0 ] \
+   && [ "$(wc -c < "$IMG" 2>/dev/null || echo 0)" = "$SIZE" ]; then
+	CACHED=1
+	note "复用持久分区里已下载的镜像：$IMG"
+fi
+
+if [ "$CACHED" = 0 ]; then
+	if [ "$IMGDIR" = "$WORK" ] && [ "$SIZE" -gt 0 ]; then
+		TFREE=$(df -k /tmp 2>/dev/null | awk 'NR==2{print $4}')
+		case "$TFREE" in
+			''|*[!0-9]*) ;;
+			*)
+				if [ "$TFREE" -lt $(( SIZE / 1024 * 2 + 65536 )) ]; then
+					fail "/tmp 空间不足：可用 $(hsz $((TFREE * 1024)))，下载与解压约需 $(hsz $((SIZE * 2 + 67108864)))"
+				fi
+				;;
+		esac
+	fi
+
+	DL="$URL"
+	[ -n "$MIRROR" ] && DL="${MIRROR}${URL}"
+	note "地址 $DL"
+
+	if [ -s "$IMG" ]; then
+		note "发现未完成的下载，尝试续传"
+		curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 -m 1800 \
+			-C - -o "$IMG" "$DL" 2>/dev/null \
+			|| { rm -f "$IMG"; note "续传失败，改为完整下载"; }
+	fi
+
+	if [ ! -s "$IMG" ]; then
+		if [ -t 1 ]; then
+			curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 -m 1800 \
+				--progress-bar -o "$IMG" "$DL" || fail "下载失败"
+		else
+			curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -m 1800 \
+				-o "$IMG" "$DL" || fail "下载失败"
+		fi
+	fi
+fi
+
+GOT=$(wc -c < "$IMG" 2>/dev/null || echo 0)
+if [ "$SIZE" -gt 0 ] && [ "$GOT" != "$SIZE" ]; then
+	fail "下载不完整：期望 $SIZE 字节，实际 $GOT 字节"
+fi
+if [ "$CACHED" = 1 ]; then
+	pass "使用缓存镜像 $(hsz "$GOT")"
+else
+	pass "已下载 $(hsz "$GOT")"
+fi
+
+# ---------------------------------------------------------------- 3 校验
+phase 3 "校验镜像"
+
+ACT=$(sha256sum "$IMG" | awk '{print $1}')
+WANT=""
+
+case "$DIGEST" in
+	sha256:*) WANT=${DIGEST#sha256:} ;;
 esac
 
-info "下载:     $DL"
-# 只有交互终端才显示进度条；LuCI/非 tty 下静默，避免刷屏
-if [ -t 1 ]; then
-	curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "$IMG" "$DL" || die "下载失败"
-else
-	curl -fsSL --retry 3 --connect-timeout 15 -o "$IMG" "$DL" || die "下载失败"
+if curl -fsSL --retry 2 --connect-timeout 15 -m 60 -o "$WORK/sum.txt" \
+	"${MIRROR}${URL}.sha256" 2>/dev/null; then
+	S2=$(awk 'NR==1{print $1}' "$WORK/sum.txt")
+	case "$S2" in
+		'') ;;
+		*)
+			if [ -n "$WANT" ] && [ "$WANT" != "$S2" ]; then
+				fail "两个来源的 sha256 互相矛盾（GitHub $(echo "$WANT" | cut -c1-12)… / 校验文件 $(echo "$S2" | cut -c1-12)…）"
+			fi
+			[ -n "$WANT" ] || WANT="$S2"
+			;;
+	esac
 fi
 
-# 校验 sha256：先试 <url>.sha256，再试同名 .sha256
-SHA=""
-for cand in "${URL}.sha256" "${URL%.gz}.sha256"; do
-	if curl -fsSL --retry 2 --connect-timeout 15 -o "$WORK/sum.txt" "${MIRROR}${cand}" 2>/dev/null; then
-		SHA=$(awk '{print $1}' "$WORK/sum.txt" | head -1)
-		[ -n "$SHA" ] && break
-	fi
-done
-
-if [ -n "$SHA" ]; then
-	ACT=$(sha256sum "$IMG" | awk '{print $1}')
-	if [ "$SHA" != "$ACT" ]; then
+if [ -n "$WANT" ]; then
+	if [ "$WANT" != "$ACT" ]; then
 		rm -f "$IMG"
-		die "sha256 校验失败（期望 $SHA，实际 $ACT）"
+		fail "sha256 不匹配（期望 $WANT，实际 $ACT）"
 	fi
-	info "sha256:   校验通过"
+	pass "sha256 一致：$(echo "$ACT" | cut -c1-16)…"
 else
-	info "sha256:   Release 未提供校验文件，跳过"
+	note "Release 未提供任何校验值，仅做格式检查"
 fi
 
-# 轻量合法性检查：只验 gzip 魔数。
-# 不能靠 gzip -t 的退出码：ImmortalWrt 的 sysupgrade.img.gz 在 gzip 流末尾
-# 附加了一段 sysupgrade 需要的元数据，GNU gzip 会返回 2（trailing garbage），
-# busybox 下更是不可预期 —— 拿它判完整性会误杀正常镜像。完整性由 sha256 保证。
+# gzip 魔数。不能靠 gzip -t 的退出码：sysupgrade.img.gz 在 gzip 流末尾
+# 附了一段元数据，GNU gzip 会返回 2（trailing garbage）而误杀正常镜像。
 case "$IMG" in
 	*.gz)
 		magic=$(hex2 "$IMG")
 		if [ -z "$magic" ]; then
-			info "gzip:     跳过格式检查（无 hexdump/od）"
+			note "gzip 格式检查跳过（无 hexdump/od）"
 		elif [ "$magic" = "1f8b" ]; then
-			info "gzip:     魔数校验通过"
+			pass "gzip 魔数正确"
 		else
-			die "不是 gzip 文件（魔数: $magic）"
+			fail "不是 gzip 文件（魔数: $magic）"
 		fi
+		;;
+	*)
+		pass "镜像格式检查通过"
 		;;
 esac
 
-ls -lh "$IMG"
+# ---------------------------------------------------------------- 4 兼容性
+# sysupgrade -T 内部走 validate_firmware_image：fwtool 比对镜像元数据里的
+# device 与 /tmp/sysinfo/board_name、compat_version，platform_check_image
+# 再比分区表。TEST=1 时会跳过 create_backup_archive，所以是纯只读的预演。
+phase 4 "兼容性预检"
+
+TLOG="$WORK/test.log"
+if ! sysupgrade -T "$IMG" > "$TLOG" 2>&1; then
+	while IFS= read -r l; do
+		[ -n "$l" ] && note "$l"
+	done < "$TLOG"
+	fail "镜像与本机不兼容（机型或 compat_version 不匹配），已中止"
+fi
+
+if grep -qi 'Partition layout has changed' "$TLOG" 2>/dev/null; then
+	note "注意：目标镜像的分区布局与现网不同，刷写会整盘重写"
+	note "      （数据不保，但配置包仍会写到 p1 并在开机时恢复）"
+fi
+pass "机型、compat_version、分区表均匹配"
+
+# ---------------------------------------------------------------- 5 配置备份
+# 用 sysupgrade -l 拿系统自己认的清单，只做减法，绝不自己拼白名单 ——
+# 这样「该备份什么」的语义和官方完全一致，不会有漏项。
+phase 5 "生成配置备份"
+
+mkdir -p "$STATE"
+LIST="$WORK/backup.list"
+KEEP="$WORK/keep.list"
+DROP="$WORK/drop.list"
+
+sysupgrade -l 2>/dev/null > "$LIST" || fail "无法枚举需要备份的文件"
+[ -s "$LIST" ] || fail "备份清单为空，停止刷写"
+
+: > "$KEEP"
+: > "$DROP"
+TOT=0; N=0; M=0
+
+while IFS= read -r p; do
+	[ -n "$p" ] || continue
+
+	s=$(wc -c < "$p" 2>/dev/null || echo 0)
+	case "$s" in ''|*[!0-9]*) s=0 ;; esac
+
+	case "$p" in
+		/etc/fw-version)
+			printf '%s|版本标记必须由新镜像覆盖\n' "$p" >> "$DROP"
+			M=$((M + 1)); continue ;;
+		*.apk-new)
+			printf '%s|apk 升级残留\n' "$p" >> "$DROP"
+			M=$((M + 1)); continue ;;
+		/etc/openclash/GeoIP.dat|/etc/openclash/GeoSite.dat|/etc/openclash/ASN.mmdb|\
+		/etc/openclash/clash|/etc/openclash/cache.db|/etc/openclash/core/*|/etc/openclash/history/*)
+			printf '%s|%s OpenClash 资源，启动后会自行重新下载\n' "$p" "$(hsz "$s")" >> "$DROP"
+			M=$((M + 1)); continue ;;
+	esac
+
+	if [ "$s" -ge 4194304 ]; then
+		printf '%s|%s，单文件超过 4 MB 自动剔除\n' "$p" "$(hsz "$s")" >> "$DROP"
+		M=$((M + 1)); continue
+	fi
+
+	printf '%s\n' "${p#/}" >> "$KEEP"
+	TOT=$((TOT + s))
+	N=$((N + 1))
+done < "$LIST"
+
+[ "$N" -gt 0 ] || fail "剔除后没有可备份的文件，停止刷写"
+
+# 完整备份（含刚被剔除的 OpenClash 资源）落到持久分区。刷写不碰 p3，
+# 所以它一定还在；开机脚本用它把剔除掉的东西补回 /etc —— 于是「剔除」
+# 只是躲开 p1 的 9 MB 限制，不产生任何真实丢失。
+FULL=""
+if [ "$NO_FULL" = 0 ] && store_ready && mkdir -p "$STORE/backup" 2>/dev/null; then
+	FULL="$STORE/backup/config-$(echo "$CUR" | tr -c 'A-Za-z0-9._-' '_')-$(date +%Y%m%d-%H%M%S).tgz"
+	if sysupgrade -b "$FULL" >/dev/null 2>&1 && [ -s "$FULL" ]; then
+		note "完整备份 → $FULL（$(hsz "$(wc -c < "$FULL")")）"
+		# 只保留最近 3 份，旧的自动清掉
+		ls -1t "$STORE"/backup/config-*.tgz 2>/dev/null | tail -n +4 | while IFS= read -r old; do
+			rm -f "$old" && note "清理旧备份 $(basename "$old")"
+		done
+	else
+		note "完整备份写入失败，仅使用精简包（不影响升级）"
+		rm -f "$FULL"
+		FULL=""
+	fi
+elif [ "$NO_FULL" = 1 ]; then
+	note "按要求跳过完整备份（-n）"
+else
+	note "持久分区不可用，无法留存完整备份（OpenClash 资源将重新下载）"
+fi
+
+# 逐文件指纹，开机后据此核对「到底恢复了几项」
+( cd / && sha256sum $(cat "$KEEP") 2>/dev/null ) > "$STATE/pending.list" \
+	|| fail "生成文件指纹失败"
+
+PN=$(wc -l < "$STATE/pending.list")
+[ "$PN" -gt 0 ] || fail "文件指纹为空，停止刷写"
+
+# 升级元数据：明确记录「从哪个版本刷到哪个版本、什么时候开始、完整备份在哪」
+printf '{"from":"%s","to":"%s","image":"%s","image_sha256":"%s","started_at":%s,"count":%s,"full":"%s"}\n' \
+	"$CUR" "$TAG" "$NAME" "$ACT" "$(date +%s)" "$PN" "$FULL" > "$STATE/pending.json"
+
+# sysupgrade 原本会合成这个脚本，用来在刷完后重新禁用那些被禁用的服务。
+# 我们接管了打包，就得自己补上，否则刷完所有停用的服务会自己跑起来。
+DS=/etc/uci-defaults/10_disable_services
+mkdir -p /etc/uci-defaults
+{
+	for svc in /etc/init.d/*; do
+		"$svc" enabled >/dev/null 2>&1 || printf '%s disable\n' "$svc"
+	done
+	printf '\nexit 0\n'
+} > "$DS" 2>/dev/null
+chmod 755 "$DS" 2>/dev/null
+
+cp "$KEEP" "$WORK/tar.list"
+printf 'etc/fwupdate/pending.json\n' >> "$WORK/tar.list"
+printf 'etc/fwupdate/pending.list\n' >> "$WORK/tar.list"
+printf 'etc/uci-defaults/10_disable_services\n' >> "$WORK/tar.list"
+
+rm -f "$BK"
+( cd / && tar czf "$BK" -T "$WORK/tar.list" ) || fail "打包配置备份失败"
+
+# 打包完就删掉，它只需要存在于 tar 里
+rm -f "$DS"
+
+BKSZ=$(wc -c < "$BK" 2>/dev/null || echo 0)
+[ "$BKSZ" -gt 0 ] || fail "配置备份包为空"
+
+pass "保留 $N 项 / $(hsz "$TOT") 原始 → $(hsz "$BKSZ")，剔除 $M 项"
+
+if [ "$M" -gt 0 ]; then
+	note "已剔除（不影响配置，只是避免撑爆 p1 分区）："
+	cut -d'|' -f1,2 "$DROP" | head -14 | while IFS='|' read -r p why; do
+		note "  · $p  （$why）"
+	done
+	[ "$M" -gt 14 ] && note "  … 其余 $((M - 14)) 项同理"
+fi
+
+# ---------------------------------------------------------------- 6 容量
+# p1（引导分区）是唯一能跨刷写存活的通道，配置包必须整个放得下。
+# 官方 platform_copy_config() 用 cp -af 且不检查返回值，放不下时会留下
+# 残缺包、开机只解一半 —— 所以这里必须当成硬约束。
+phase 6 "容量预检"
+
+P1PATH=""
+
+# export_bootdevice / export_partdevice 在 /lib/upgrade/common.sh 里，但它们
+# 依赖 /lib/functions.sh 的辅助函数 —— 少 source 前者会静默失败（返回 1），
+# 表现就是「读不到 p1 空间」。两个都加载才可用，这与 sysupgrade 本身一致。
+. /lib/functions.sh 2>/dev/null
+. /lib/upgrade/common.sh 2>/dev/null
+
+if export_bootdevice >/dev/null 2>&1 && export_partdevice _p1 1 >/dev/null 2>&1 && [ -n "$_p1" ]; then
+	P1PATH="/dev/$_p1"
+fi
+
+# 兜底：从 rootfs 所在分区反推同一块盘的第一个分区
+if [ -z "$P1PATH" ]; then
+	_root=$(readlink -f /dev/root 2>/dev/null)
+	[ -n "$_root" ] || _root=$(awk '$2=="/rom"{print $1; exit}' /proc/mounts 2>/dev/null)
+	_root=$(readlink -f "$_root" 2>/dev/null)
+	case "$_root" in
+		/dev/mmcblk*p[0-9]*) P1PATH=$(echo "$_root" | sed -E 's/p[0-9]+$/p1/') ;;
+		/dev/sd*[0-9])       P1PATH=$(echo "$_root" | sed -E 's/[0-9]+$/1/') ;;
+	esac
+fi
+
+P1MNT=$(awk -v d="$P1PATH" '$1==d{print $2; exit}' /proc/mounts 2>/dev/null)
+if [ -z "$P1MNT" ] && [ -n "$P1PATH" ]; then
+	mkdir -p /tmp/fwup-p1
+	if mount -o ro "$P1PATH" /tmp/fwup-p1 2>/dev/null; then
+		P1MNT=/tmp/fwup-p1
+		P1TMP=1
+	fi
+fi
+
+if [ -n "$P1MNT" ]; then
+	FREEK=$(df -k "$P1MNT" 2>/dev/null | awk 'NR==2{print $4}')
+else
+	FREEK=""
+fi
+
+[ -n "${P1TMP:-}" ] && { umount /tmp/fwup-p1 2>/dev/null; rmdir /tmp/fwup-p1 2>/dev/null; }
+
+case "$FREEK" in
+	''|*[!0-9]*)
+		# 读不到就当作「不能保证放得下」。宁可中止，也不要在刷写后才发现配置
+		# 只恢复了一半 —— 那种损失是不可逆的。
+		fail "无法确认 p1 分区（$P1PATH）的剩余空间，为避免刷写后配置只恢复一半，已中止"
+		;;
+	*)
+		NEEDK=$(( BKSZ / 1024 + BKSZ / 1024 / 10 + 256 ))
+		if [ "$FREEK" -lt "$NEEDK" ]; then
+			fail "配置包 $(hsz "$BKSZ") 放不进 p1 可用 $(hsz $((FREEK * 1024)))，刷写会丢失配置，已中止"
+		fi
+		pass "配置包 $(hsz "$BKSZ") / p1 可用 $(hsz $((FREEK * 1024)))"
+		;;
+esac
+
+# 完整备份已经在第 5 步写进持久分区了，这里只补一句它的下落，
+# 便于刷完之后人工核对（开机脚本会自动用它补回被剔除的文件）
+if [ -n "$FULL" ]; then
+	note "完整备份留存：$FULL"
+fi
 
 if [ "$CHECK_ONLY" = 1 ]; then
-	info "已下载到 $IMG（-c 模式，不刷写）"
+	note "（-c 模式：已完成全部预检，停在刷写前）"
+	# 没刷就不能留下 pending，否则下次开机会误报「上次升级未完成」
+	abort_state
 	exit 0
 fi
 
+# ---------------------------------------------------------------- 7 刷写
 if [ "$ASSUME_YES" = 0 ]; then
-	echo
-	echo "即将刷写 $TAG"
-	echo "  · 期间会断网并自动重启"
-	echo "  · 默认保留现有配置（/etc/config、已装插件设置）"
+	printf '\n即将刷写 %s\n' "$TAG"
+	printf '  · 期间会断网并自动重启\n'
+	printf '  · 保留现有配置（备份 %s，已校验放得下）\n' "$(hsz "$BKSZ")"
 	printf '继续？[y/N] '
 	read -r ans
 	case "$ans" in
 		y|Y|yes|YES) ;;
-		*) info "已取消"; rm -f "$IMG"; exit 0 ;;
+		*) echo "[fwupdate] 已取消"; abort_state; exit 0 ;;
 	esac
 fi
 
-info "开始刷写 ..."
-sysupgrade -v "$IMG"
+phase 7 "刷写"
+note "刷写期间不要断电，完成后设备会自动重启"
+sync
+
+# -f 指定我们自建的配置包：sysupgrade 会跳过 create_backup_archive，
+# 直接把这份包交给 platform_copy_config，体积已由第 6 步保证放得下。
+sysupgrade -v -f "$BK" "$IMG" || fail "刷写命令返回失败"

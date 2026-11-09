@@ -1,0 +1,113 @@
+#!/bin/sh
+# /etc/uci-defaults/97_luci-app-fwupdate-verify
+#
+# 开机自证 + 补齐：升级到底成没成、配置到底恢复了几项。
+#
+# 流程：
+#   1. /usr/bin/fwupdate 刷写前把 pending.json / pending.list 打进配置包，
+#      重启时 preinit 解包，它们落到 /etc/fwupdate/；
+#   2. 这里（早于任何服务启动）先把持久分区挂上，用其中的完整备份把
+#      p1 装不下、被主动剔除的文件（OpenClash 的 GeoIP/GeoSite/内核等）
+#      补回 /etc —— 所以「剔除」不产生真实丢失；
+#   3. 再按 pending.list 逐文件核对指纹，写出 result.json 并删除 pending，
+#      只报告一次。
+#
+# 之所以要放进配置包而不是刷写前直接写在 /etc：刷写会整块替换 rootfs，
+# 写在 /etc 里的东西活不过重启，只有包里的能跨过去。
+
+P=/etc/fwupdate/pending.json
+L=/etc/fwupdate/pending.list
+R=/etc/fwupdate/result.json
+STORE=/mnt/fwstore
+
+[ -f "$P" ] || exit 0
+[ -f "$L" ] || { rm -f "$P"; exit 0; }
+
+from=$(jsonfilter -i "$P" -e '@.from' 2>/dev/null)
+to=$(jsonfilter -i "$P" -e '@.to' 2>/dev/null)
+img=$(jsonfilter -i "$P" -e '@.image' 2>/dev/null)
+sha=$(jsonfilter -i "$P" -e '@.image_sha256' 2>/dev/null)
+started=$(jsonfilter -i "$P" -e '@.started_at' 2>/dev/null)
+total=$(jsonfilter -i "$P" -e '@.count' 2>/dev/null)
+full=$(jsonfilter -i "$P" -e '@.full' 2>/dev/null)
+
+case "$started" in ''|*[!0-9]*) started=0 ;; esac
+case "$total"   in ''|*[!0-9]*) total=0   ;; esac
+case "$full"    in 'null') full="" ;; esac
+
+# ---- 1. 挂持久分区并补齐被剔除的文件 -------------------------------
+# uci-defaults 由 /etc/init.d/boot(START=10) 触发，而 fstab 的 mount 动作在
+# boot() 里、START=11 —— 所以到这一步持久分区通常还没挂上，得自己挂。
+fromstore=0
+
+if [ -n "$full" ]; then
+	if ! awk -v p="$STORE" '$2==p{f=1} END{exit !f}' /proc/mounts 2>/dev/null; then
+		mkdir -p "$STORE" 2>/dev/null
+		/sbin/block mount >/dev/null 2>&1
+	fi
+	# block 还没就绪时的兜底：按标签找，再按设备名找
+	if ! awk -v p="$STORE" '$2==p{f=1} END{exit !f}' /proc/mounts 2>/dev/null; then
+		mount -L fwstore "$STORE" 2>/dev/null \
+			|| mount /dev/mmcblk0p3 "$STORE" 2>/dev/null
+	fi
+
+	if [ -f "$full" ]; then
+		tar xzf "$full" -C / 2>/dev/null && fromstore=1
+	fi
+fi
+
+# ---- 2. 逐文件核对指纹 ---------------------------------------------
+cur=$(tr -d ' \r\n' < /etc/fw-version 2>/dev/null)
+now=$(date +%s)
+elapsed=$(( now - started ))
+[ "$elapsed" -ge 0 ] || elapsed=0
+
+ok=0
+changed=0
+missing=0
+mlist=""
+
+while read -r h p; do
+	[ -n "$p" ] || continue
+	if [ ! -e "/$p" ]; then
+		missing=$((missing + 1))
+		[ "$missing" -le 6 ] && mlist="$mlist $p"
+		continue
+	fi
+	h2=$(sha256sum "/$p" 2>/dev/null | awk '{print $1}')
+	if [ "$h2" = "$h" ]; then
+		ok=$((ok + 1))
+	else
+		changed=$((changed + 1))
+	fi
+done < "$L"
+
+# 结论分四档：
+#   ok          版本已到目标值，备份里的文件一个不少
+#   partial     版本已变，但有文件没恢复（真正需要警惕的情况）
+#   notapplied  版本没变，说明刷写没生效或中途取消
+#   unknown     版本变成了第三个值（比如刷了别的镜像）
+if [ "$cur" = "$to" ]; then
+	if [ "$missing" -eq 0 ]; then status=ok; else status=partial; fi
+elif [ "$cur" = "$from" ]; then
+	status=notapplied
+else
+	status=unknown
+fi
+
+mkdir -p /etc/fwupdate
+{
+	printf '{"status":"%s","from":"%s","to":"%s","cur":"%s"' \
+		"$status" "$from" "$to" "$cur"
+	printf ',"total":%s,"ok":%s,"changed":%s,"missing":%s' \
+		"$total" "$ok" "$changed" "$missing"
+	printf ',"started_at":%s,"at":%s,"elapsed":%s' \
+		"$started" "$now" "$elapsed"
+	printf ',"image":"%s","image_sha256":"%s"' "$img" "$sha"
+	printf ',"restored_from_store":%s' "$fromstore"
+	printf ',"missing_list":"%s"}\n' "$mlist"
+} > "$R" 2>/dev/null
+
+rm -f "$P" "$L"
+
+exit 0

@@ -1,7 +1,35 @@
 #!/bin/sh
-# 首次启动：把构建时写入的 /etc/fwupdate-repo 迁移到 uci 配置里，
-# 这样界面上的「仓库」输入框有值可改。
+# 首次启动 / 全新刷入后执行一次：
+#   1. 确保持久分区（p3，ext4，标签 fwstore）开机能自动挂到 /mnt/fwstore；
+#   2. 把构建时写入的 /etc/fwupdate-repo 迁移到 uci 配置里，界面才有值可改。
+#
+# 第 1 步是幂等的：已经有 /mnt/fwstore 的挂载项就什么都不做。正常情况下
+# /etc/config/fstab 会被升级流程备份并还原，这里只是兜住「全新刷入」的情况。
 
+# ---- 1. 持久分区的开机挂载项 ----
+if [ -e /dev/mmcblk0p3 ] && ! uci -q show fstab 2>/dev/null | grep -q "target='/mnt/fwstore'"; then
+	# 直接从 ext4 超级块读 UUID（偏移 1024 + 104，16 字节）。
+	# 这一步跑在任何服务启动之前，ubus/block 都还不可用，所以不能问它们要。
+	_u=$(dd if=/dev/mmcblk0p3 bs=1 skip=1128 count=16 2>/dev/null \
+		| hexdump -v -e '16/1 "%02x"')
+	if [ ${#_u} -eq 32 ]; then
+		_u=$(echo "$_u" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/')
+	fi
+
+	uci -q add fstab mount >/dev/null 2>&1
+	uci -q set "fstab.@mount[-1].target=/mnt/fwstore"
+	uci -q set "fstab.@mount[-1].enabled=1"
+	uci -q set "fstab.@mount[-1].options=noatime"
+	if [ ${#_u} -eq 36 ]; then
+		uci -q set "fstab.@mount[-1].uuid=$_u"
+	else
+		uci -q set "fstab.@mount[-1].device=/dev/mmcblk0p3"
+	fi
+	uci -q commit fstab
+	mkdir -p /mnt/fwstore
+fi
+
+# ---- 2. 仓库地址迁移 ----
 [ -f /etc/fwupdate-repo ] || exit 0
 
 cur=$(uci -q get fwupdate.main.repo)

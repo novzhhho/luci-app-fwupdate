@@ -17,6 +17,8 @@ LOG=/tmp/fwupdate.log
 DLDIR=/tmp/fwupdate.d
 REPO_FALLBACK=/etc/fwupdate-repo
 VER_FILE=/etc/fw-version
+RESULT=/etc/fwupdate/result.json
+STORE=/mnt/fwstore
 UA='luci-app-fwupdate'
 
 # 插件自身：仓库、构建时写入的 commit 短 sha、以及远端检查缓存
@@ -89,6 +91,46 @@ do_status() {
 	fi
 
 	json_add_boolean running "$(is_running && echo 1 || echo 0)"
+
+	# 持久分区（p3）：有它才有完整备份和镜像缓存
+	if awk -v p="$STORE" '$2==p{f=1} END{exit !f}' /proc/mounts 2>/dev/null; then
+		json_add_boolean store 1
+		json_add_int store_free "$(df -k "$STORE" 2>/dev/null | awk 'NR==2{print $4 * 1024}')"
+	else
+		json_add_boolean store 0
+		json_add_int store_free 0
+	fi
+
+	# 上次升级的自证结果：由开机脚本写在 result.json，只报告一次
+	# 注意 jshn 的 json_add_int 不接受空值（会写出非法 JSON），所以统一走
+	# 这两个小包装，缺字段时给安全默认值。
+	rj() { jsonfilter -i "$RESULT" -e "$1" 2>/dev/null; }
+	rn() { local v; v=$(rj "$1"); case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+
+	json_add_string last_status ""
+	json_add_string last_from ""
+	json_add_string last_to ""
+	json_add_int    last_total 0
+	json_add_int    last_ok 0
+	json_add_int    last_changed 0
+	json_add_int    last_missing 0
+	json_add_int    last_at 0
+	json_add_int    last_elapsed 0
+	json_add_boolean last_store 0
+
+	if [ -f "$RESULT" ]; then
+		json_add_string last_status "$(rj '@.status')"
+		json_add_string last_from   "$(rj '@.from')"
+		json_add_string last_to     "$(rj '@.to')"
+		json_add_int    last_total   "$(rn '@.total')"
+		json_add_int    last_ok      "$(rn '@.ok')"
+		json_add_int    last_changed "$(rn '@.changed')"
+		json_add_int    last_missing "$(rn '@.missing')"
+		json_add_int    last_at      "$(rn '@.at')"
+		json_add_int    last_elapsed "$(rn '@.elapsed')"
+		json_add_boolean last_store  "$(rj '@.restored_from_store')"
+	fi
+
 	json_dump
 }
 
@@ -192,7 +234,14 @@ do_log() {
 
 	is_running && run=1
 	[ -f "$CACHE" ] && total=$(jsonfilter -i "$CACHE" -e '@.size' 2>/dev/null)
-	sz=$(ls -l "$DLDIR"/*.img.gz "$DLDIR"/*.img 2>/dev/null | head -n1 | awk '{print $5}')
+
+	# 镜像可能落在持久分区（缓存复用），所以以 fwupdate 写的路径文件为准，
+	# 拿不到再退回按扩展名找 /tmp 里的下载文件
+	if [ -f "$DLDIR/current.path" ]; then
+		p=$(cat "$DLDIR/current.path" 2>/dev/null)
+		[ -n "$p" ] && [ -f "$p" ] && sz=$(wc -c < "$p" 2>/dev/null)
+	fi
+	[ -n "$sz" ] || sz=$(ls -l "$DLDIR"/*.img.gz "$DLDIR"/*.img 2>/dev/null | head -n1 | awk '{print $5}')
 
 	json_init
 	json_add_boolean ok 1
