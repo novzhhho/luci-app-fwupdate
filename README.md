@@ -146,8 +146,19 @@ config fwupdate 'main'
 **固件**用 tag 字符串比对，不用语义化版本：`/etc/fw-version` 存的是构建时的 tag，
 和 Release 的 `tag_name` 不同就认为有新版。上游任何一个组件变化、CI 生成了新 tag，页面就会提示更新。
 
-**插件自身**用 commit 短 sha 比对：构建时把 sha 写进 `/usr/share/luci-app-fwupdate/build`，
-Release 的 tag 就是那个 sha，两者不同即视为有新版本。
+**插件自身**比两样东西，缺一不可：
+
+1. **revision 判新旧**——`PKG_RELEASE` 在 CI 里取 commit 数，单调递增，所以
+   `1.0.0-r13` 一定比 `r12` 新。只有远端 revision 更大才算「有新版」。
+2. **commit 短 sha 判身份**——构建时烧进 `/usr/share/luci-app-fwupdate/build`，
+   Release 的 tag 就是那个 sha，用来确认「装的是不是这一份」。
+
+为什么不能只比 sha 相不相等：sha 只是内容指纹，不含时序。`/tmp` 里的检查缓存
+不重启就不会消失，里面存的 `latest` 可能是几天前的；那时远端 sha 与本地不同，
+只比相等就会把更旧的包当成新版本装上去 —— 这是**降级**，不是升级（真踩过：
+本地 r12 被指向 r10）。因此 `selfupdate` 在装机前会再核一次 revision，不新就
+拒绝并清掉过期缓存。这一步不能省，因为 ubus 方法可以被直接调用，界面禁用按钮
+只是提示，不是防护。
 
 两个副作用：
 
