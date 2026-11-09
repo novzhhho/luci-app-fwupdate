@@ -57,6 +57,15 @@ reply_err() {
 	json_dump
 }
 
+# jshn 的 json_add_int 收到空值会吐出一段非法 JSON（`"key": ,`），整条 ubus 回包
+# 就废了。凡是从 jsonfilter / sed 里取来的数字，一律过这里兜成 0。
+jint() {
+	local v
+	v="$2"
+	case "$v" in ''|*[!0-9-]*) v=0 ;; esac
+	json_add_int "$1" "$v"
+}
+
 # ---------------------------------------------------------------- status
 do_status() {
 	local cur repo latest size ts has
@@ -297,30 +306,62 @@ do_setconfig() {
 # sha 与 Release 的 tag，不同就说明有新版本，直接 apk add 覆盖安装。
 self_local() { tr -d ' \r\n' < "$BUILD_FILE" 2>/dev/null; }
 
+# 已装包的 revision 号（luci-app-fwupdate-1.0.0-r12 → 12）。
+# PKG_RELEASE 在 CI 里取 commit 数，所以它单调递增，可以用来判新旧。
+self_rev() {
+	apk list -I luci-app-fwupdate 2>/dev/null \
+		| sed -n 's/^luci-app-fwupdate-[^ ]*-r\([0-9][0-9]*\)[ ].*/\1/p' | head -n1
+}
+
+# 从 apk 下载地址里抠 revision（...-1.0.0-r12.apk → 12），抠不出返回空。
+# 先砍掉 ?query 和 #frag：加速前缀/跳转链接可能带尾巴，不砍就匹配不上。
+rev_of_url() {
+	local u="${1%%\?*}"
+	u="${u%%#*}"
+	echo "${u##*/}" | sed -n 's/.*-r\([0-9][0-9]*\)\.apk$/\1/p'
+}
+
+# 远端是否**真的更新**。只比 sha 相等/不等是不够的：sha 是内容指纹，不含时序，
+# 旧缓存的 sha 不同也会被判成"有新版"，一装就是降级（实测踩过）。
+is_newer() {
+	_lr=$1; _rr=$2; _ls=$3; _rs=$4
+	if [ -n "$_lr" ] && [ -n "$_rr" ]; then
+		[ "$_rr" -gt "$_lr" ] && return 0
+		return 1
+	fi
+	# 任一边取不到 revision 时退回比对 sha，但至少要求远端 sha 非空
+	[ -n "$_rs" ] && [ "$_rs" != "$_ls" ]
+}
+
 do_self_status() {
-	local local_sha remote has ts
+	local local_sha local_rv remote rr has ts
 
 	local_sha=$(self_local)
-	remote=''; has=0; ts=0
+	local_rv=$(self_rev)
+	remote=''; rr=''; has=0; ts=0
 
 	if [ -f "$SELF_CACHE" ]; then
 		remote=$(jsonfilter -i "$SELF_CACHE" -e '@.tag' 2>/dev/null)
+		rr=$(jsonfilter -i "$SELF_CACHE" -e '@.rev' 2>/dev/null)
 		ts=$(jsonfilter -i "$SELF_CACHE" -e '@.checked_at' 2>/dev/null)
 		case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
-		[ -n "$remote" ] && [ "$remote" != "$local_sha" ] && has=1
+		[ -z "$rr" ] && rr=$(rev_of_url "$(jsonfilter -i "$SELF_CACHE" -e '@.url' 2>/dev/null)")
+		[ -n "$remote" ] && is_newer "$local_rv" "$rr" "$local_sha" "$remote" && has=1
 	fi
 
 	json_init
 	json_add_boolean ok 1
 	json_add_string local "${local_sha:-dev}"
 	json_add_string remote "$remote"
+	jint local_rev "$local_rv"
+	jint remote_rev "$rr"
 	json_add_int checked_at "$ts"
 	json_add_boolean has_update "$has"
 	json_dump
 }
 
 do_self_check() {
-	local api tmp code tag url size pub local_sha has
+	local api tmp code tag url size pub local_sha local_rv rr has
 
 	api="https://api.github.com/repos/$SELF_REPO/releases/latest"
 	tmp=/tmp/fwupdate-self-release.json
@@ -348,19 +389,22 @@ do_self_check() {
 
 	size=$(jsonfilter -i "$tmp" -e "@.assets[@.name=\"${url##*/}\"].size" 2>/dev/null)
 	pub=$(jsonfilter -i "$tmp" -e '@.published_at' 2>/dev/null)
+	rr=$(rev_of_url "$url")
 
 	json_init
 	json_add_string tag "$tag"
 	json_add_string url "$url"
 	json_add_int size "${size:-0}"
 	json_add_string published_at "$pub"
+	jint rev "$rr"
 	json_add_int checked_at "$(date +%s)"
 	json_dump > "$SELF_CACHE"
 	json_cleanup
 
 	local_sha=$(self_local)
+	local_rv=$(self_rev)
 	has=0
-	[ "$tag" != "$local_sha" ] && has=1
+	is_newer "$local_rv" "$rr" "$local_sha" "$tag" && has=1
 
 	json_init
 	json_add_boolean ok 1
@@ -374,10 +418,25 @@ do_self_check() {
 }
 
 do_self_update() {
-	local url tmp out rc before after
+	local url tmp out rc before after rtag rrev lrev lsha
 
 	url=$(jsonfilter -i "$SELF_CACHE" -e '@.url' 2>/dev/null)
 	[ -n "$url" ] || { reply_err "请先检查插件更新"; return; }
+
+	# 装机前必须再确认一次"远端确实更新"。缓存可能来自几天前（/tmp 里的文件
+	# 不重启就不会消失），那时的 latest 也许比现在装的还旧——照装就是降级。
+	# 这一步是兜底，不能省：界面按钮的禁用只是提示，ubus 可以被直接调用。
+	rtag=$(jsonfilter -i "$SELF_CACHE" -e '@.tag' 2>/dev/null)
+	rrev=$(jsonfilter -i "$SELF_CACHE" -e '@.rev' 2>/dev/null)
+	[ -z "$rrev" ] && rrev=$(rev_of_url "$url")
+	lrev=$(self_rev)
+	lsha=$(self_local)
+
+	if ! is_newer "$lrev" "$rrev" "$lsha" "$rtag"; then
+		rm -f "$SELF_CACHE"
+		reply_err "远端构建（r${rrev:-?} / ${rtag:-未取到}）不比已装的（r${lrev:-?} / ${lsha:-dev}）新，已拒绝安装并清掉过期缓存，请重新检查"
+		return
+	fi
 
 	tmp=/tmp/luci-app-fwupdate-new.apk
 	rm -f "$tmp"
@@ -395,6 +454,12 @@ do_self_update() {
 
 	after=$(self_local)
 	rm -f "$SELF_CACHE"
+
+	# 装完再核对一次：万一 apk 真把版本装回去了，这里要能当场发现
+	if [ -n "$after" ] && [ "$after" = "$before" ]; then
+		reply_err "安装命令返回成功，但构建指纹没变（仍是 $before），可能并未真正替换"
+		return
+	fi
 	# 这里**不能** reload rpcd：本次 ubus 调用正是由它处理的，重启会把回包弄丢，
 	# 前端会看到超时（实测如此）。apk 覆盖后，下一次 call 本来就会用新脚本，
 	# 不需要重启；只有全新安装才需要（由 post-install 负责）。

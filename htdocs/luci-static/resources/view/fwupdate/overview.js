@@ -770,8 +770,11 @@ return view.extend({
 				E('span', { class: 'fw-plug-k' }, '升级插件'),
 				E('div', { class: 'fw-plug-v' }, [
 					E('code', { id: 'fw-self-local' }, this.shortSha(sf && sf.local) || 'dev'),
-					E('span', { class: 'fw-plug-k' }, '→'),
-					E('code', { id: 'fw-self-remote' }, this.shortSha(sf && sf.remote) || '未检查'),
+					E('span', { class: 'fw-plug-k', id: 'fw-self-arrow',
+						style: (sf && sf.has_update) ? '' : 'display:none' }, '→'),
+					E('code', { id: 'fw-self-remote',
+						style: (sf && sf.has_update) ? '' : 'display:none' },
+						this.shortSha(sf && sf.remote) || '未检查'),
 					E('span', { class: 'fw-plug-k', id: 'fw-self-state' }, '—')
 				]),
 				E('div', { class: 'fw-btns' }, [
@@ -845,6 +848,7 @@ return view.extend({
 			dl:        this.node.querySelector('#fw-dl'),
 			log:       this.node.querySelector('#fw-log'),
 			selfLocal: this.node.querySelector('#fw-self-local'),
+			selfArrow: this.node.querySelector('#fw-self-arrow'),
 			selfRemote:this.node.querySelector('#fw-self-remote'),
 			selfState: this.node.querySelector('#fw-self-state'),
 			selfUp:    this.node.querySelector('#fw-self-up'),
@@ -898,22 +902,27 @@ return view.extend({
 
 		if (!sf) {
 			this.refs.selfState.textContent = '接口未响应';
+			this.paintSelfTarget(false);
 		}
 		else if (selfStale) {
 			this.refs.selfState.textContent = '待检查';
 			this.refs.selfUp.disabled = true;
+			this.paintSelfTarget(false);
 		}
 		else if (sf.has_update) {
 			this.refs.selfState.textContent = '有新版可更新';
 			this.refs.selfUp.disabled = false;
+			this.paintSelfTarget(true);
 		}
 		else if (sf.remote) {
 			this.refs.selfState.textContent = '已是最新';
 			this.refs.selfUp.disabled = true;
+			this.paintSelfTarget(false);
 		}
 		else {
 			this.refs.selfState.textContent = '未检查';
 			this.refs.selfUp.disabled = true;
+			this.paintSelfTarget(false);
 		}
 
 		/* 上一次尝试如果停在中途，日志还在 /tmp 里。刷新页面后必须能看见它
@@ -1164,6 +1173,14 @@ return view.extend({
 		}
 	},
 
+	/* 只有确认"远端确实更新"时才画 `本地 → 远端`。远端构建不比本地新的时候
+	   还画一个箭头指着旧版本，等于在骗用户点"更新插件"，而那是降级。 */
+	paintSelfTarget: function(on) {
+		var d = on ? '' : 'none';
+		if (this.refs.selfArrow)  this.refs.selfArrow.style.display  = d;
+		if (this.refs.selfRemote) this.refs.selfRemote.style.display = d;
+	},
+
 	handleSelfCheck: function() {
 		var self = this;
 
@@ -1175,6 +1192,7 @@ return view.extend({
 
 			if (!res || res.ok === false) {
 				self.refs.selfState.textContent = '检查失败';
+				self.paintSelfTarget(false);
 				ui.addNotification(null,
 					E('p', {}, '检查插件更新失败：' + ((res && res.error) || '未知错误')), 'error');
 				return;
@@ -1186,14 +1204,17 @@ return view.extend({
 			if (res.has_update) {
 				self.refs.selfState.textContent = '有新版可更新';
 				self.refs.selfUp.disabled = false;
+				self.paintSelfTarget(true);
 			}
 			else {
 				self.refs.selfState.textContent = '已是最新';
 				self.refs.selfUp.disabled = true;
+				self.paintSelfTarget(false);
 			}
 		}, function(e) {
 			self.refs.selfCk.disabled = false;
 			self.refs.selfState.textContent = '检查失败';
+			self.paintSelfTarget(false);
 			ui.addNotification(null,
 				E('p', {}, '检查插件更新失败：' + e), 'error');
 		});
@@ -1229,7 +1250,11 @@ return view.extend({
 		return callSelfUpdate().then(function(res) {
 			if (!res || res.ok === false) {
 				self.refs.selfState.textContent = '更新失败';
-				self.refs.selfUp.disabled = false;
+				/* 失败原因可能是"远端不比本地新"——那种情况下后端已经把过期缓存
+				   清掉了，再点一次也只会提示"请先检查"。所以统一要求重新检查，
+				   别让按钮停在可点状态诱导重试。 */
+				self.refs.selfUp.disabled = true;
+				self.paintSelfTarget(false);
 				ui.addNotification(null,
 					E('p', {}, '更新失败：' + ((res && res.error) || '未知错误')), 'error');
 				return;
@@ -1252,7 +1277,8 @@ return view.extend({
 				}
 
 				self.refs.selfState.textContent = '更新失败';
-				self.refs.selfUp.disabled = false;
+				self.refs.selfUp.disabled = true;
+				self.paintSelfTarget(false);
 				ui.addNotification(null, E('p', {}, '更新失败：' + e), 'error');
 			});
 		});
