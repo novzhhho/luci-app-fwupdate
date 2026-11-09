@@ -37,13 +37,17 @@ get_repo() {
 
 get_cur() { tr -d ' \r\n' < "$VER_FILE" 2>/dev/null; }
 
-# 后台升级是否在跑。只认完整的二进制路径，避免匹配到本脚本自己。
+# 后台升级是否在跑。
+# 不能用 `pgrep -f "$BIN"`：那会把「命令行里只是提到这个路径」的进程也算进
+# 来（比如在 SSH 里 grep / 编辑它），于是界面莫名其妙报「已有任务在运行」。
+# 优先按进程名精确匹配；setsid 之前进程名是 sh，再退到锚定行首的命令行匹配。
 is_running() {
 	if command -v pgrep >/dev/null 2>&1; then
-		pgrep -f "$BIN" >/dev/null 2>&1
-	else
-		ps w 2>/dev/null | grep -v grep | grep -q "$BIN"
+		pgrep -x fwupdate >/dev/null 2>&1 && return 0
+		pgrep -f "^$BIN( |\$)" >/dev/null 2>&1 && return 0
+		return 1
 	fi
+	ps w 2>/dev/null | grep -v grep | grep -qE "(^| )$BIN( |\$)"
 }
 
 reply_err() {
@@ -294,13 +298,15 @@ do_setconfig() {
 self_local() { tr -d ' \r\n' < "$BUILD_FILE" 2>/dev/null; }
 
 do_self_status() {
-	local local_sha remote has
+	local local_sha remote has ts
 
 	local_sha=$(self_local)
-	remote=''; has=0
+	remote=''; has=0; ts=0
 
 	if [ -f "$SELF_CACHE" ]; then
 		remote=$(jsonfilter -i "$SELF_CACHE" -e '@.tag' 2>/dev/null)
+		ts=$(jsonfilter -i "$SELF_CACHE" -e '@.checked_at' 2>/dev/null)
+		case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
 		[ -n "$remote" ] && [ "$remote" != "$local_sha" ] && has=1
 	fi
 
@@ -308,6 +314,7 @@ do_self_status() {
 	json_add_boolean ok 1
 	json_add_string local "${local_sha:-dev}"
 	json_add_string remote "$remote"
+	json_add_int checked_at "$ts"
 	json_add_boolean has_update "$has"
 	json_dump
 }

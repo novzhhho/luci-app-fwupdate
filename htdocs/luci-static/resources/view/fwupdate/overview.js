@@ -20,8 +20,10 @@ function fmtSize(n) {
 		return '未知';
 	if (n < 1048576)
 		return (Math.round(n / 1024 * 10) / 10) + ' KB';
+	if (n < 1073741824)
+		return (Math.round(n / 1048576 * 10) / 10) + ' MB';
 
-	return (Math.round(n / 1048576 * 10) / 10) + ' MB';
+	return (Math.round(n / 1073741824 * 10) / 10) + ' GB';
 }
 
 function fmtTime(ts) {
@@ -293,9 +295,10 @@ return view.extend({
 
 		return Promise.all([
 			callStatus().then(function(r) { return r; }, fail),
-			callSelfStatus().then(function(r) { return r; }, fail)
+			callSelfStatus().then(function(r) { return r; }, fail),
+			callLog().then(function(r) { return r; }, fail)
 		]).then(function(r) {
-			return { st: r[0], self: r[1] };
+			return { st: r[0], self: r[1], lg: r[2] };
 		});
 	},
 
@@ -375,7 +378,8 @@ return view.extend({
 		if (o.published)
 			items.push('发布于 ' + String(o.published).replace('T', ' ').substring(0, 16));
 
-		items.push('上次检查 ' + (o.checked ? fmtTime(o.checked) : '—'));
+		items.push('上次检查 ' + (o.checked ? fmtTime(o.checked) : '—') +
+			(o.stale ? '（已过期，请重新检查）' : ''));
 
 		if (o.store)
 			items.push('持久分区可用 ' + fmtSize(o.storeFree));
@@ -607,10 +611,13 @@ return view.extend({
 			if (n < 1 || n > CHECKS.length)
 				continue;
 
-			if (this._ckState[n] !== st || (msg && this._ckMsg[n] !== msg)) {
+			/* 一步可能有多条 ok（比如校验步骤先报 sha256 再报 gzip）。
+			   保留第一条更有信息量的，失败/进行中的则始终覆盖。 */
+			if (msg && (st !== 'ok' || !this._ckMsg[n] || this._ckState[n] !== 'ok'))
+				this._ckMsg[n] = msg;
+
+			if (this._ckState[n] !== st) {
 				this._ckState[n] = st;
-				if (msg)
-					this._ckMsg[n] = msg;
 				changed = true;
 			}
 
@@ -656,6 +663,7 @@ return view.extend({
 	render: function(data) {
 		var st = (data && data.st) || null,
 		    sf = (data && data.self) || null,
+		    lg = (data && data.lg) || null,
 		    s = st || {},
 		    self = this;
 
@@ -742,7 +750,7 @@ return view.extend({
 				E('div', { class: 'cbi-progressbar', id: 'fw-bar', title: '' }, [
 					E('div', { id: 'fw-bar-fill', style: 'width:0%' })
 				]),
-				E('div', { class: 'fw-dlinfo' }, [
+				E('div', { class: 'fw-dlinfo', id: 'fw-dlinfo' }, [
 					E('span', { class: 'fw-pct', id: 'fw-pct' }, '0%'),
 					E('span', { id: 'fw-dl' }, '等待开始')
 				]),
@@ -829,6 +837,8 @@ return view.extend({
 			notesSum:  this.node.querySelector('#fw-notes-sum'),
 			notesBody: this.node.querySelector('#fw-notes-body'),
 			progCard:  this.node.querySelector('#fw-progress'),
+			bar:       this.node.querySelector('#fw-bar'),
+			dlInfo:    this.node.querySelector('#fw-dlinfo'),
 			steps:     this.node.querySelectorAll('#fw-steps .fw-step'),
 			barFill:   this.node.querySelector('#fw-bar-fill'),
 			pct:       this.node.querySelector('#fw-pct'),
@@ -845,9 +855,18 @@ return view.extend({
 		};
 
 		/* ------- 初始状态 ------- */
+		/* 检查结果有保鲜期。过期了就不能再拿它当「有新版本」的依据 ——
+		   真正的升级动作会重新问 GitHub，界面上的旧 tag 和实际要刷的东西
+		   对不上，是最容易让人点错的一种状态。 */
+		var fwStale = !s.checked_at ||
+			(Date.now() - s.checked_at * 1000) > 24 * 3600 * 1000;
+		var selfStale = !sf || !sf.checked_at ||
+			(Date.now() - sf.checked_at * 1000) > 30 * 60 * 1000;
+
 		this.setVersions(s.current, s.latest);
 		this.setMeta({
 			size: s.size, published: s.published_at, checked: s.checked_at,
+			stale: fwStale && !!s.checked_at,
 			store: s.store, storeFree: s.store_free
 		});
 		this.renderLast(s);
@@ -863,28 +882,56 @@ return view.extend({
 			this.showProgress();
 			this.startPolling();
 		}
-		else if (s.has_update) {
+		else if (s.has_update && !fwStale) {
 			this.setBadge('new', '有新版本');
 			this.showNotes(s.body);
 			this.refs.upBtn.disabled = false;
+		}
+		else if (fwStale) {
+			this.setBadge('ok', '待检查');
+			this.refs.upBtn.disabled = true;
 		}
 		else if (s.latest)
 			this.setBadge('ok', '已是最新');
 		else
 			this.setBadge('ok', '待检查');
 
-		if (sf) {
-			if (sf.has_update) {
-				this.refs.selfState.textContent = '有新版可更新';
-				this.refs.selfUp.disabled = false;
-			}
-			else if (sf.remote)
-				this.refs.selfState.textContent = '已是最新';
-			else
-				this.refs.selfState.textContent = '未检查';
+		if (!sf) {
+			this.refs.selfState.textContent = '接口未响应';
+		}
+		else if (selfStale) {
+			this.refs.selfState.textContent = '待检查';
+			this.refs.selfUp.disabled = true;
+		}
+		else if (sf.has_update) {
+			this.refs.selfState.textContent = '有新版可更新';
+			this.refs.selfUp.disabled = false;
+		}
+		else if (sf.remote) {
+			this.refs.selfState.textContent = '已是最新';
+			this.refs.selfUp.disabled = true;
 		}
 		else {
-			this.refs.selfState.textContent = '接口未响应';
+			this.refs.selfState.textContent = '未检查';
+			this.refs.selfUp.disabled = true;
+		}
+
+		/* 上一次尝试如果停在中途，日志还在 /tmp 里。刷新页面后必须能看见它
+		   停在哪一步、为什么停 —— 否则用户只知道「点了没反应」。 */
+		if (!s.running && lg && lg.log && /#step /.test(lg.log)) {
+			this.refs.log.textContent = lg.log;
+			this.lastLog = lg.log;
+			this.applyMarkers(lg.log);
+
+			var bad = this.failedStep();
+			if (bad) {
+				this.showProgress();
+				/* 历史日志里没有本次的下载进度，显示「0%」只会误导 */
+				this.refs.bar.style.display = 'none';
+				this.refs.dlInfo.style.display = 'none';
+				this.setBadge('err', '上次升级未通过：第 ' + bad + ' 步');
+				this.refs.upBtn.disabled = true;
+			}
 		}
 
 		return this.node;
@@ -976,6 +1023,8 @@ return view.extend({
 
 			self.refs.upBtn.disabled = true;
 			self.refs.log.textContent = '';
+			self.refs.bar.style.display = '';
+			self.refs.dlInfo.style.display = '';
 			self.setBadge('run', '升级中');
 			self.showProgress();
 			self.setSteps(0);
