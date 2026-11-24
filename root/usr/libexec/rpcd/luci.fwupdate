@@ -92,12 +92,24 @@ gh_asset_size() {
 	printf '%s' "$_n"
 }
 
-# 更新说明只有 API 有。失败（含 403）就返回空，调用方当作"没有说明"。
-gh_body() {
-	curl -s --connect-timeout 8 -m 20 \
+# 更新说明和发布时间只有 API 有，一次请求一起取。失败（含 403）就当没有。
+# 注意返回值走全局变量而不是 stdout：写成 body=$(gh_meta ...) 会开子 shell，
+# 第二个值就带不出来了（同一个坑踩过两次，这里索性都不用命令替换）。
+GH_BODY=''
+GH_PUB=''
+
+gh_meta() {
+	local j
+	GH_BODY=''; GH_PUB=''
+	j=$(curl -s --connect-timeout 8 -m 20 \
 		-H 'Accept: application/vnd.github+json' -H "User-Agent: $UA" \
-		"https://api.github.com/repos/$1/releases/tags/$2" 2>/dev/null \
-		| jsonfilter -e '@.body' 2>/dev/null
+		"https://api.github.com/repos/$1/releases/tags/$2" 2>/dev/null)
+	case "$j" in
+		*'"assets"'*)
+			GH_BODY=$(printf '%s' "$j" | jsonfilter -e '@.body' 2>/dev/null)
+			GH_PUB=$(printf '%s' "$j" | jsonfilter -e '@.published_at' 2>/dev/null)
+			;;
+	esac
 }
 
 # 后台升级是否在跑。
@@ -261,15 +273,17 @@ do_check() {
 		case "$size" in ''|*[!0-9]*) size=0 ;; esac
 	fi
 
-	# 第三步：更新说明。tag 没变就复用缓存，变了才去问一次 API；问不到就不带
-	# 说明，照样把检查结果正常返回。
+	# 第三步：更新说明与发布时间。tag 没变就复用缓存，变了才去问一次 API；
+	# 问不到就不带这两项，照样把检查结果正常返回。
 	pub=''; body=''
 	if [ "$has" = 0 ] && [ -f "$CACHE" ] \
 	   && [ "$(jsonfilter -i "$CACHE" -e '@.tag' 2>/dev/null)" = "$tag" ]; then
 		pub=$(jsonfilter -i "$CACHE" -e '@.published_at' 2>/dev/null)
 		body=$(jsonfilter -i "$CACHE" -e '@.body' 2>/dev/null)
 	else
-		body=$(gh_body "$repo" "$tag")
+		gh_meta "$repo" "$tag"
+		body=$GH_BODY
+		pub=$GH_PUB
 	fi
 	[ -n "$body" ] && [ ${#body} -gt 3000 ] && body=$(printf '%s' "$body" | head -c 3000)
 
