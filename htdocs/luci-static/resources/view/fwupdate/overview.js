@@ -398,6 +398,13 @@ return view.extend({
 		if (!this.refs)
 			return;
 
+		/* 说明只有 GitHub API 能给，而 API 按 IP 每小时只有 60 次配额。
+		   被限流时拿不到说明，这时不要摆一个空壳出来，直接收起。 */
+		if (!body || !String(body).trim()) {
+			this.hideNotes();
+			return;
+		}
+
 		this.renderNotes(body);
 		this.refs.notes.style.display = '';
 		this.refs.notes.open = true;

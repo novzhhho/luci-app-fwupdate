@@ -12,19 +12,22 @@
 . /usr/share/libubox/jshn.sh
 
 BIN=/usr/bin/fwupdate
-CACHE=/tmp/fwupdate-check.json
+STATE_DIR=/etc/fwupdate
+# 检查结果放持久目录而不是 /tmp：更新说明只有 API 能给，而 API 按 IP 每小时
+# 只有 60 次；缓存到磁盘后，同版本只需取一次，重启也不至于又要去问一次。
+CACHE=$STATE_DIR/check.json
 LOG=/tmp/fwupdate.log
 DLDIR=/tmp/fwupdate.d
 REPO_FALLBACK=/etc/fwupdate-repo
 VER_FILE=/etc/fw-version
-RESULT=/etc/fwupdate/result.json
+RESULT=$STATE_DIR/result.json
 STORE=/mnt/fwstore
 UA='luci-app-fwupdate'
 
 # 插件自身：仓库、构建时写入的 commit 短 sha、以及远端检查缓存
 SELF_REPO='novzhhho/luci-app-fwupdate'
 BUILD_FILE=/usr/share/luci-app-fwupdate/build
-SELF_CACHE=/tmp/fwupdate-self.json
+SELF_CACHE=$STATE_DIR/self.json
 
 cfg() { uci -q get "fwupdate.main.$1" 2>/dev/null; }
 
@@ -36,6 +39,57 @@ get_repo() {
 }
 
 get_cur() { tr -d ' \r\n' < "$VER_FILE" 2>/dev/null; }
+
+# ------------------------------------------------------------ GitHub 探测
+# 匿名访问 api.github.com 按**出口 IP** 每小时只有 60 次配额，正常点几下
+# 「检查更新」就能耗尽，然后整整一小时里每次都是 403 —— 这不是"过几分钟
+# 再试"的事。但下面两条网页路径不消耗 API 配额：
+#   1. /releases/latest 会 302 到 /releases/tag/<tag>，tag 就在 Location 里
+#   2. /releases/expanded_assets/<tag> 返回一段 HTML，含全部资产的下载路径
+# 于是把 API 降级成"只用来取更新说明"：取不到就不带说明，绝不能因此把一次
+# 成功的检查判成失败。
+# 注意：这两个是**全局**变量，由下面的函数直接赋值。
+# 不能写成 TAG=$(gh_latest_tag)——命令替换会开子 shell，函数里设置的状态码
+# 出不来，于是每次都被当成"连不上"（踩过）。
+GH_CODE=''
+GH_TAG=''
+
+gh_latest_tag() {
+	local out
+	out=$(curl -sI --connect-timeout 8 -m 20 -H "User-Agent: $UA" \
+		-w '\nGHC:%{http_code}' \
+		"https://github.com/$1/releases/latest" 2>/dev/null)
+	GH_CODE=''
+	GH_TAG=''
+	case "$out" in
+		*GHC:*) GH_CODE=${out##*GHC:} ;;
+	esac
+	GH_TAG=$(printf '%s\n' "$out" \
+		| sed -n 's|^[Ll]ocation:[[:space:]]*.*/releases/tag/||p' \
+		| tr -d '\r' | head -n1)
+}
+
+gh_assets() {
+	[ -n "$2" ] || return 0
+	curl -s --connect-timeout 8 -m 25 -H "User-Agent: $UA" \
+		"https://github.com/$1/releases/expanded_assets/$2" 2>/dev/null \
+		| grep -oE "$1/releases/download/[^\"'<> ]+" | sort -u
+}
+
+# HEAD 跟随重定向后读 Content-Length。注意中间那跳 302 的 length 是 0，
+# 所以必须取**最后**一个。
+gh_asset_size() {
+	curl -sIL --connect-timeout 8 -m 30 -H "User-Agent: $UA" "$1" 2>/dev/null \
+		| sed -n 's|^[Cc]ontent-[Ll]ength:[[:space:]]*||p' | tr -d '\r' | tail -n1
+}
+
+# 更新说明只有 API 有。失败（含 403）就返回空，调用方当作"没有说明"。
+gh_body() {
+	curl -s --connect-timeout 8 -m 20 \
+		-H 'Accept: application/vnd.github+json' -H "User-Agent: $UA" \
+		"https://api.github.com/repos/$1/releases/tags/$2" 2>/dev/null \
+		| jsonfilter -e '@.body' 2>/dev/null
+}
 
 # 后台升级是否在跑。
 # 不能用 `pgrep -f "$BIN"`：那会把「命令行里只是提到这个路径」的进程也算进
@@ -149,7 +203,7 @@ do_status() {
 
 # ---------------------------------------------------------------- check
 do_check() {
-	local repo api tmp code tag url name size pub body cur has
+	local repo tag assets url size pub cur has body
 
 	repo=$(get_repo)
 	[ -n "$repo" ] || { reply_err "还没有配置 GitHub 仓库（owner/repo）"; return; }
@@ -158,45 +212,49 @@ do_check() {
 		*) reply_err "仓库格式应为 owner/repo"; return ;;
 	esac
 
-	api="https://api.github.com/repos/$repo/releases/latest"
-	tmp=/tmp/fwupdate-release.json
-	rm -f "$tmp"
-
-	code=$(curl -sS -o "$tmp" -w '%{http_code}' \
-		--retry 2 --connect-timeout 10 -m 30 \
-		-H 'Accept: application/vnd.github+json' \
-		-H "User-Agent: $UA" "$api" 2>/dev/null)
-
-	case "$code" in
-		200) ;;
-		404) reply_err "仓库不存在，或该仓库还没有发布 Release（HTTP 404）"; return ;;
-		403) reply_err "GitHub API 被限流（HTTP 403），过几分钟再试"; return ;;
-		''|000) reply_err "连不上 GitHub API（检查路由器网络 / DNS）"; return ;;
-		*) reply_err "GitHub API 返回 HTTP $code"; return ;;
-	esac
-
-	tag=$(jsonfilter -i "$tmp" -e '@.tag_name' 2>/dev/null)
-	[ -n "$tag" ] || { reply_err "解析 Release 失败（没有 tag_name）"; return; }
-
-	url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img\.gz$' | head -n1)
-	[ -n "$url" ] || url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null | grep '\.img$' | head -n1)
-	[ -n "$url" ] || { reply_err "该 Release 里没有 .img.gz / .img 资产"; return; }
-
-	name=${url##*/}
-	size=$(jsonfilter -i "$tmp" -e "@.assets[@.name=\"$name\"].size" 2>/dev/null)
-	pub=$(jsonfilter -i "$tmp" -e '@.published_at' 2>/dev/null)
-	body=$(jsonfilter -i "$tmp" -e '@.body' 2>/dev/null)
-	[ -n "$body" ] && [ ${#body} -gt 3000 ] && body=$(printf '%s' "$body" | head -c 3000)
-
 	cur=$(get_cur)
+	mkdir -p "${CACHE%/*}" 2>/dev/null
+
+	# 第一步：零配额探测最新 tag
+	gh_latest_tag "$repo"
+	tag=$GH_TAG
+	case "$GH_CODE" in
+		302) ;;
+		404) reply_err "仓库不存在，或该仓库还没有发布 Release（HTTP 404）"; return ;;
+		429) reply_err "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试"; return ;;
+		''|000) reply_err "连不上 GitHub（检查路由器网络 / DNS）"; return ;;
+		*) reply_err "GitHub 返回 HTTP $GH_CODE"; return ;;
+	esac
+	[ -n "$tag" ] || { reply_err "解析 Releases 跳转失败（没拿到 tag）"; return; }
+
 	has=0
 	[ -n "$cur" ] && [ "$tag" != "$cur" ] && has=1
 
-	# 缓存给 status / log 用
+	# 第二步：零配额列资产 + 零配额取大小
+	assets=$(gh_assets "$repo" "$tag")
+	url=$(printf '%s\n' "$assets" | grep -E '\.img\.gz$' | head -n1)
+	[ -n "$url" ] || url=$(printf '%s\n' "$assets" | grep -E '\.img$' | head -n1)
+	[ -n "$url" ] || { reply_err "该 Release 里没有 .img.gz / .img 资产"; return; }
+	url="https://github.com/$url"
+	size=$(gh_asset_size "$url")
+	case "$size" in ''|*[!0-9]*) size=0 ;; esac
+
+	# 第三步：更新说明。tag 没变就复用缓存，变了才去问一次 API；问不到就不带
+	# 说明，照样把检查结果正常返回。
+	pub=''; body=''
+	if [ "$has" = 0 ] && [ -f "$CACHE" ] \
+	   && [ "$(jsonfilter -i "$CACHE" -e '@.tag' 2>/dev/null)" = "$tag" ]; then
+		pub=$(jsonfilter -i "$CACHE" -e '@.published_at' 2>/dev/null)
+		body=$(jsonfilter -i "$CACHE" -e '@.body' 2>/dev/null)
+	else
+		body=$(gh_body "$repo" "$tag")
+	fi
+	[ -n "$body" ] && [ ${#body} -gt 3000 ] && body=$(printf '%s' "$body" | head -c 3000)
+
 	json_init
 	json_add_string tag "$tag"
 	json_add_string url "$url"
-	json_add_int size "${size:-0}"
+	jint size "$size"
 	json_add_string published_at "$pub"
 	json_add_int checked_at "$(date +%s)"
 	json_add_string body "$body"
@@ -208,7 +266,7 @@ do_check() {
 	json_add_string current "$cur"
 	json_add_string tag "$tag"
 	json_add_string url "$url"
-	json_add_int size "${size:-0}"
+	jint size "$size"
 	json_add_string published_at "$pub"
 	json_add_int checked_at "$(date +%s)"
 	json_add_string body "$body"
@@ -361,40 +419,41 @@ do_self_status() {
 }
 
 do_self_check() {
-	local api tmp code tag url size pub local_sha local_rv rr has
+	local tag assets url size pub local_sha local_rv rr has
 
-	api="https://api.github.com/repos/$SELF_REPO/releases/latest"
-	tmp=/tmp/fwupdate-self-release.json
-	rm -f "$tmp"
+	mkdir -p "${SELF_CACHE%/*}" 2>/dev/null
 
-	code=$(curl -sS -o "$tmp" -w '%{http_code}' \
-		--retry 2 --connect-timeout 10 -m 30 \
-		-H 'Accept: application/vnd.github+json' \
-		-H "User-Agent: $UA" "$api" 2>/dev/null)
-
-	case "$code" in
-		200) ;;
+	# 与固件检查同一套路：302 拿 tag + HTML 列资产，全程不碰 API 配额
+	gh_latest_tag "$SELF_REPO"
+	tag=$GH_TAG
+	case "$GH_CODE" in
+		302) ;;
 		404) reply_err "插件仓库还没有发布过构建（HTTP 404）"; return ;;
-		403) reply_err "GitHub API 被限流（HTTP 403），过几分钟再试"; return ;;
-		''|000) reply_err "连不上 GitHub API（检查路由器网络 / DNS）"; return ;;
-		*) reply_err "GitHub API 返回 HTTP $code"; return ;;
+		429) reply_err "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试"; return ;;
+		''|000) reply_err "连不上 GitHub（检查路由器网络 / DNS）"; return ;;
+		*) reply_err "GitHub 返回 HTTP $GH_CODE"; return ;;
 	esac
+	[ -n "$tag" ] || { reply_err "解析 Releases 跳转失败（没拿到 tag）"; return; }
 
-	tag=$(jsonfilter -i "$tmp" -e '@.tag_name' 2>/dev/null)
-	[ -n "$tag" ] || { reply_err "解析 Release 失败（没有 tag_name）"; return; }
-
-	url=$(jsonfilter -i "$tmp" -e '@.assets[*].browser_download_url' 2>/dev/null \
-		| grep 'luci-app-fwupdate.*\.apk$' | head -n1)
+	assets=$(gh_assets "$SELF_REPO" "$tag")
+	url=$(printf '%s\n' "$assets" | grep -E 'luci-app-fwupdate.*\.apk$' | head -n1)
 	[ -n "$url" ] || { reply_err "该 Release 里没有插件 apk"; return; }
+	url="https://github.com/$url"
 
-	size=$(jsonfilter -i "$tmp" -e "@.assets[@.name=\"${url##*/}\"].size" 2>/dev/null)
-	pub=$(jsonfilter -i "$tmp" -e '@.published_at' 2>/dev/null)
+	size=$(gh_asset_size "$url")
+	case "$size" in ''|*[!0-9]*) size=0 ;; esac
+	# 发布时间网页路径拿不到；tag 没变就沿用上次记下的
+	pub=''
+	if [ -f "$SELF_CACHE" ] \
+	   && [ "$(jsonfilter -i "$SELF_CACHE" -e '@.tag' 2>/dev/null)" = "$tag" ]; then
+		pub=$(jsonfilter -i "$SELF_CACHE" -e '@.published_at' 2>/dev/null)
+	fi
 	rr=$(rev_of_url "$url")
 
 	json_init
 	json_add_string tag "$tag"
 	json_add_string url "$url"
-	json_add_int size "${size:-0}"
+	jint size "$size"
 	json_add_string published_at "$pub"
 	jint rev "$rr"
 	json_add_int checked_at "$(date +%s)"
