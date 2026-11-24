@@ -166,6 +166,34 @@ config fwupdate 'main'
   `fwupdate -f` 强制重刷。
 - 手动刷过比 Release 更新的自编包时，`/etc/fw-version` 与 Release 不一致，会一直提示有新版。
 
+## 为什么不走 GitHub API
+
+匿名访问 `api.github.com` 按**出口 IP** 每小时只有 60 次配额。这个额度小到点几下
+「检查更新」就会耗尽，然后整整一小时里每次都是 403 —— 早期版本就是这样，用户会
+看到「检查失败：GitHub API 被限流」。
+
+现在主流程全部走两条**不消耗 API 配额**的网页路径：
+
+| 需要什么 | 怎么拿 | 配额 |
+|---|---|---|
+| 最新 tag | `GET /releases/latest` 的 `%{redirect_url}` → `/releases/tag/<tag>` | 0 |
+| 资产文件名 | `GET /releases/expanded_assets/<tag>` 的 HTML 里 grep 下载路径 | 0 |
+| 资产大小 | `Range: bytes=0-1`，从 `Content-Range: bytes 0-1/<总长>` 读总长 | 0 |
+| digest / 发布时间 / 更新说明 | 仍要 API，**拿不到就不拿** | 1~2 |
+
+API 只剩最后一行的可选增强：取不到 digest 时，第 3 步会退回下载 Release 里的
+`.sha256` 文件做校验（照旧双来源交叉校验）；取不到更新时间说明，界面就不显示
+「更新说明」那一栏。**限流不再导致检查失败。**
+
+两个坑记在这里：
+
+- 不要用 `curl -I`（HEAD）做探测。实测同一个仓库的 HEAD 会偶发返回 000（连不上），
+  紧接着 GET 却正常 302 —— 边缘节点对 HEAD 的处理不一致。
+- 探测函数不能用 `TAG=$(gh_latest_tag)` 调用。命令替换会开子 shell，函数里设置的
+  状态码带不出来，调用方会一律判成「连不上」。改成全局变量回传。
+
+命令 `fwupdate -l`（列历史 tag）仍然只能走 API，限流时会明确说清楚，日常升级不受影响。
+
 ## 依赖
 
 运行时：`curl`、`jsonfilter`、`rpcd`、`luci-base`（Makefile 里已声明）。

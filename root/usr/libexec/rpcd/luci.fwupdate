@@ -55,18 +55,18 @@ GH_CODE=''
 GH_TAG=''
 
 gh_latest_tag() {
-	local out
-	out=$(curl -sI --connect-timeout 8 -m 20 -H "User-Agent: $UA" \
-		-w '\nGHC:%{http_code}' \
+	local out loc
+	# 用 GET + %{redirect_url} 拿 Location。不要用 -I(HEAD)：实测同一仓库
+	# 的 HEAD 会莫名其妙报 000，而 GET 正常 302（GitHub 边缘节点行为不一致）。
+	out=$(curl -s -o /dev/null --connect-timeout 8 -m 20 \
+		-H "User-Agent: $UA" -w '%{http_code} %{redirect_url}' \
 		"https://github.com/$1/releases/latest" 2>/dev/null)
-	GH_CODE=''
+	GH_CODE=${out%% *}
+	loc=${out#* }
 	GH_TAG=''
-	case "$out" in
-		*GHC:*) GH_CODE=${out##*GHC:} ;;
+	case "$loc" in
+		*/releases/tag/*) GH_TAG=${loc##*/releases/tag/} ;;
 	esac
-	GH_TAG=$(printf '%s\n' "$out" \
-		| sed -n 's|^[Ll]ocation:[[:space:]]*.*/releases/tag/||p' \
-		| tr -d '\r' | head -n1)
 }
 
 gh_assets() {
@@ -76,11 +76,20 @@ gh_assets() {
 		| grep -oE "$1/releases/download/[^\"'<> ]+" | sort -u
 }
 
-# HEAD 跟随重定向后读 Content-Length。注意中间那跳 302 的 length 是 0，
-# 所以必须取**最后**一个。
+# 取资产大小。同样避开 HEAD：用 Range 只请 2 字节，从 Content-Range 的
+# "bytes 0-1/<总长>" 里读总长；服务器不支持 Range 时退回 Content-Length。
+# 注意中间那跳 302 的 Content-Length 是 0，所以一律取最后一个匹配。
 gh_asset_size() {
-	curl -sIL --connect-timeout 8 -m 30 -H "User-Agent: $UA" "$1" 2>/dev/null \
-		| sed -n 's|^[Cc]ontent-[Ll]ength:[[:space:]]*||p' | tr -d '\r' | tail -n1
+	local _h _n
+	_h=$(curl -sL -r 0-1 -o /dev/null -D - --connect-timeout 8 -m 30 \
+		-H "User-Agent: $UA" "$1" 2>/dev/null)
+	_n=$(printf '%s\n' "$_h" \
+		| sed -n 's|^[Cc]ontent-[Rr]ange:[^/]*/||p' | tr -d '\r' | tail -n1)
+	if [ -z "$_n" ]; then
+		_n=$(printf '%s\n' "$_h" \
+			| sed -n 's|^[Cc]ontent-[Ll]ength:[[:space:]]*||p' | tr -d '\r' | tail -n1)
+	fi
+	printf '%s' "$_n"
 }
 
 # 更新说明只有 API 有。失败（含 403）就返回空，调用方当作"没有说明"。
@@ -215,17 +224,20 @@ do_check() {
 	cur=$(get_cur)
 	mkdir -p "${CACHE%/*}" 2>/dev/null
 
-	# 第一步：零配额探测最新 tag
+	# 第一步：零配额探测最新 tag。
+	# 判定以"拿到 tag"为准，而不是以状态码为准——有些代理/加速层会把 302
+	# 改写成 200 但照样带着 Location，死抠 302 会误判成失败。
 	gh_latest_tag "$repo"
 	tag=$GH_TAG
-	case "$GH_CODE" in
-		302) ;;
-		404) reply_err "仓库不存在，或该仓库还没有发布 Release（HTTP 404）"; return ;;
-		429) reply_err "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试"; return ;;
-		''|000) reply_err "连不上 GitHub（检查路由器网络 / DNS）"; return ;;
-		*) reply_err "GitHub 返回 HTTP $GH_CODE"; return ;;
-	esac
-	[ -n "$tag" ] || { reply_err "解析 Releases 跳转失败（没拿到 tag）"; return; }
+	if [ -z "$tag" ]; then
+		case "$GH_CODE" in
+			404) reply_err "仓库不存在，或该仓库还没有发布 Release（HTTP 404）"; return ;;
+			429) reply_err "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试"; return ;;
+			''|000) reply_err "连不上 GitHub（检查路由器网络 / DNS）"; return ;;
+		esac
+		reply_err "解析 Releases 跳转失败（HTTP ${GH_CODE:-?}，没拿到 tag）"
+		return
+	fi
 
 	has=0
 	[ -n "$cur" ] && [ "$tag" != "$cur" ] && has=1
@@ -426,14 +438,15 @@ do_self_check() {
 	# 与固件检查同一套路：302 拿 tag + HTML 列资产，全程不碰 API 配额
 	gh_latest_tag "$SELF_REPO"
 	tag=$GH_TAG
-	case "$GH_CODE" in
-		302) ;;
-		404) reply_err "插件仓库还没有发布过构建（HTTP 404）"; return ;;
-		429) reply_err "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试"; return ;;
-		''|000) reply_err "连不上 GitHub（检查路由器网络 / DNS）"; return ;;
-		*) reply_err "GitHub 返回 HTTP $GH_CODE"; return ;;
-	esac
-	[ -n "$tag" ] || { reply_err "解析 Releases 跳转失败（没拿到 tag）"; return; }
+	if [ -z "$tag" ]; then
+		case "$GH_CODE" in
+			404) reply_err "插件仓库还没有发布过构建（HTTP 404）"; return ;;
+			429) reply_err "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试"; return ;;
+			''|000) reply_err "连不上 GitHub（检查路由器网络 / DNS）"; return ;;
+		esac
+		reply_err "解析 Releases 跳转失败（HTTP ${GH_CODE:-?}，没拿到 tag）"
+		return
+	fi
 
 	assets=$(gh_assets "$SELF_REPO" "$tag")
 	url=$(printf '%s\n' "$assets" | grep -E 'luci-app-fwupdate.*\.apk$' | head -n1)

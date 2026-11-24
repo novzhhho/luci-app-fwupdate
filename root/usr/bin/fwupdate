@@ -153,17 +153,15 @@ GH_CODE=''
 GH_TAG=''
 
 gh_latest_tag() {
-	_ghout=$(curl -sI --connect-timeout 8 -m 20 -H "User-Agent: $UA" \
-		-w '\nGHC:%{http_code}' \
+	_ghout=$(curl -s -o /dev/null --connect-timeout 8 -m 20 \
+		-H "User-Agent: $UA" -w '%{http_code} %{redirect_url}' \
 		"https://github.com/$REPO/releases/latest" 2>/dev/null)
-	GH_CODE=''
+	GH_CODE=${_ghout%% *}
+	_ghloc=${_ghout#* }
 	GH_TAG=''
-	case "$_ghout" in
-		*GHC:*) GH_CODE=${_ghout##*GHC:} ;;
+	case "$_ghloc" in
+		*/releases/tag/*) GH_TAG=${_ghloc##*/releases/tag/} ;;
 	esac
-	GH_TAG=$(printf '%s\n' "$_ghout" \
-		| sed -n 's|^[Ll]ocation:[[:space:]]*.*/releases/tag/||p' \
-		| tr -d '\r' | head -n1)
 }
 
 gh_assets() {
@@ -172,10 +170,18 @@ gh_assets() {
 		| grep -oE "$REPO/releases/download/[^\"'<> ]+" | sort -u
 }
 
-# 中间那跳 302 的 Content-Length 是 0，必须取最后一个
+# 避开 HEAD（实测同一仓库的 HEAD 会偶发 000）：用 Range 只请 2 字节，
+# 从 Content-Range 的 "bytes 0-1/<总长>" 读总长，不支持时退回 Content-Length。
 gh_asset_size() {
-	curl -sIL --connect-timeout 8 -m 30 -H "User-Agent: $UA" "$1" 2>/dev/null \
-		| sed -n 's|^[Cc]ontent-[Ll]ength:[[:space:]]*||p' | tr -d '\r' | tail -n1
+	_ghh=$(curl -sL -r 0-1 -o /dev/null -D - --connect-timeout 8 -m 30 \
+		-H "User-Agent: $UA" "$1" 2>/dev/null)
+	_ghn=$(printf '%s\n' "$_ghh" \
+		| sed -n 's|^[Cc]ontent-[Rr]ange:[^/]*/||p' | tr -d '\r' | tail -n1)
+	if [ -z "$_ghn" ]; then
+		_ghn=$(printf '%s\n' "$_ghh" \
+			| sed -n 's|^[Cc]ontent-[Ll]ength:[[:space:]]*||p' | tr -d '\r' | tail -n1)
+	fi
+	printf '%s' "$_ghn"
 }
 
 echo "[fwupdate] 仓库:     $REPO"
@@ -213,14 +219,16 @@ if [ -n "$TARGET" ]; then
 else
 	gh_latest_tag
 	TAG=$GH_TAG
-	case "$GH_CODE" in
-		302) ;;
-		404) fail "仓库不存在，或该仓库还没有发布 Release（HTTP 404）" ;;
-		429) fail "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试" ;;
-		''|000) fail "连不上 GitHub（检查路由器网络 / DNS）" ;;
-		*) fail "GitHub 返回 HTTP $GH_CODE" ;;
-	esac
-	[ -n "$TAG" ] || fail "解析 Releases 跳转失败（没拿到 tag）"
+	# 有 tag 就算成功。不按状态码判，因为有代理会把 302 改写成 200
+	# 但照样带 Location。
+	if [ -z "$TAG" ]; then
+		case "$GH_CODE" in
+			404) fail "仓库不存在，或该仓库还没有发布 Release（HTTP 404）" ;;
+			429) fail "GitHub 网页请求也被限流了（HTTP 429），等几分钟再试" ;;
+			''|000) fail "连不上 GitHub（检查路由器网络 / DNS）" ;;
+		esac
+		fail "解析 Releases 跳转失败（HTTP ${GH_CODE:-?}，没拿到 tag）"
+	fi
 fi
 
 if [ "$TAG" = "$CUR" ] && [ "$FORCE" = 0 ]; then
