@@ -242,14 +242,24 @@ do_check() {
 	has=0
 	[ -n "$cur" ] && [ "$tag" != "$cur" ] && has=1
 
-	# 第二步：零配额列资产 + 零配额取大小
-	assets=$(gh_assets "$repo" "$tag")
-	url=$(printf '%s\n' "$assets" | grep -E '\.img\.gz$' | head -n1)
-	[ -n "$url" ] || url=$(printf '%s\n' "$assets" | grep -E '\.img$' | head -n1)
-	[ -n "$url" ] || { reply_err "该 Release 里没有 .img.gz / .img 资产"; return; }
-	url="https://github.com/$url"
-	size=$(gh_asset_size "$url")
-	case "$size" in ''|*[!0-9]*) size=0 ;; esac
+	# 第二步：只有真出现新版本才去列资产、取大小（实测这两步要 2.4 秒）。
+	# 「已是最新」是绝大多数情况，只花掉前面那一次 0.8 秒的探测就够了。
+	if [ "$has" = 0 ]; then
+		url=''; size=0
+		if [ -f "$CACHE" ] && [ "$(jsonfilter -i "$CACHE" -e '@.tag' 2>/dev/null)" = "$tag" ]; then
+			url=$(jsonfilter -i "$CACHE" -e '@.url' 2>/dev/null)
+			size=$(jsonfilter -i "$CACHE" -e '@.size' 2>/dev/null)
+			case "$size" in ''|*[!0-9]*) size=0 ;; esac
+		fi
+	else
+		assets=$(gh_assets "$repo" "$tag")
+		url=$(printf '%s\n' "$assets" | grep -E '\.img\.gz$' | head -n1)
+		[ -n "$url" ] || url=$(printf '%s\n' "$assets" | grep -E '\.img$' | head -n1)
+		[ -n "$url" ] || { reply_err "该 Release 里没有 .img.gz / .img 资产"; return; }
+		url="https://github.com/$url"
+		size=$(gh_asset_size "$url")
+		case "$size" in ''|*[!0-9]*) size=0 ;; esac
+	fi
 
 	# 第三步：更新说明。tag 没变就复用缓存，变了才去问一次 API；问不到就不带
 	# 说明，照样把检查结果正常返回。
